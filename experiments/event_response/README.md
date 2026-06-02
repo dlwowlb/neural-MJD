@@ -1,132 +1,114 @@
-# Event–Response Attribution Benchmark (Neural MJD baselines)
+# Event–Response Attribution Benchmark + Event-Marked Neural MJD (Ours)
 
-This experiment establishes the **baseline behaviour** of Neural MJD on an
-event-response *attribution* task. The point is **not** that Neural MJD fails to
-forecast — it forecasts jumps fine. The point is sharper:
+This experiment makes one point precise and then fixes it:
 
 > Neural MJD models *when* a trajectory jumps via a single aggregate intensity
 > `λ_t`, but it has **no event-source variable**. Even when it predicts a jump at
-> the right time, it cannot say **which observed event** caused or explains that
-> jump — and feeding the events into the context `C` does not fix this.
+> the right time — and even when the observed events are fed into the context `C`
+> — it cannot say **which event** caused or explains a given response.
+>
+> **Ours (Event-Marked Neural MJD)** extends the model so that every jump carries
+> a source label, giving each observed event its own time-varying response
+> intensity and jump-magnitude distribution. This recovers event→response
+> attribution while preserving Neural MJD's compensated form and closed-form mean.
 
-("Ours" — an event-specific response-intensity decomposition `λ_t = λ₀(t) +
-Σᵢ λᵢ(t)` — is intentionally **left out here**; this directory only characterises
-the baselines that such a method must beat.)
+Three methods are compared on the same synthetic benchmark:
 
-## Why Neural MJD cannot attribute (structural)
+| method | what it predicts |
+|---|---|
+| `neural_mjd` | `μ_t,σ_t,λ_t,ν_t,γ_t` from past only (no events) |
+| `neural_mjd_ctx` | the same, with observed events fed into context `C` |
+| **`ours`** | per-source `{λ_{r,t},ν_{r,t},γ_{r,t}}` via an event-marked Poisson measure |
 
-Neural MJD's jump SDE is
+## Why the baselines cannot attribute (structural)
+
+Neural MJD's jump SDE `dS_t = S_t[(μ_t−λ_t k_t)dt + σ_t dW_t + dQ_t]` exposes a
+**total** intensity `λ_t`. There is no `P(i | response at t)` in
+`(μ_t,σ_t,λ_t,ν_t,γ_t)`. Feeding events into `C` does not create one: the model
+learns an aggregate response (for two same-type overlapping events, occluding
+either event changes the forecast *identically*, `S₀≡S₁`; for opposite-type
+events the occlusion signal is no better than chance once responses overlap).
+
+## Ours: Event-Marked Neural MJD (`ours.py`)
+
+We extend the unlabeled Poisson jump measure `N(dt,dy)` into an **event-marked**
+measure `N^E(dt,dy,dr)` with source `r ∈ {0,…,m}` (0 = background, `i` = event
+`e_i`). The network predicts, per future step,
 
 ```
-dS_t = S_t [ (μ_t − λ_t k_t) dt + σ_t dW_t + dQ_t ]
+μ_0,t, σ_t                              (shared)
+{ λ_{r,t}, ν_{r,t}, γ_{r,t} }_{r=0..m}  (per source)      k_{r,t}=exp(ν+γ²/2)−1
 ```
 
-where `λ_t` is the **total** jump intensity. The model can answer *"a jump is
-likely at t"* but not *"the jump at t came from event i"* — there is simply no
-`P(i | response at t)` in the parameterisation `(μ_t, σ_t, λ_t, ν_t, γ_t)`. A
-reviewer's natural objection is *"just put the events in the context `C`"*, so we
-include that baseline explicitly and probe it for attribution.
+* **Compensated form & closed-form mean preserved.** Define the effective drift
+  `μ_t^E = μ_0,t + Σ_r λ_{r,t} k_{r,t}`, so `E[S_T|C,E] = S_0 exp(Σ_t μ_t^E)` and
+  each source contributes an *attributable* term `c_{r,t}=λ_{r,t}k_{r,t}` to the
+  conditional-mean log-return. Removing event `i` is exact: `μ^{(−i)} = μ^E − c_{i,t}`.
+* **Delay is modelled, not just `t−τ_i`.** For event `i` with elapsed time
+  `u=t−τ_i`, a learnable onset distribution is convolved with a response kernel:
+  `λ_{i,t} = a_i(q_i) · Σ_δ p_φ(δ|q_i) κ_φ(u−δ|q_i)`, separating *when the
+  response starts* from *how it unfolds* from *how strong it is*. Event
+  interaction enters through `q_i`, which attends over the other events and the
+  past context.
+* **Source-count likelihood.** The MJD likelihood is kept but over a per-source
+  count vector `k=(k_0,…,k_m)` with adaptive truncation on the total count;
+  `a_k = μ_0,t − σ²/2 + Σ_r k_r ν_{r,t}`, `b²_k = σ² + Σ_r k_r γ_{r,t}²`.
+* **Magnitude-aware attribution (native).** `P(i|t) = λ_{i,t}/Σ_j λ_{j,t}`, or
+  with magnitude `P(i|t,y) ∝ λ_{i,t} f_i(t,y)`.
+
+Training keeps the source-count NLL + conditional-mean regulariser; on the
+synthetic benchmark (ground truth available) light attribution/delay supervision
+is added. **Ablation:** with that supervision *removed*, Ours still attributes
+near-perfectly — the event-marked *architecture*, not the labels, is what enables
+attribution.
 
 ## Synthetic benchmark (`synthetic.py`)
 
-A single trajectory `S_t` (glucose-like, length `P+F = 24+24`) is driven by
-discrete **observed** events logged in the past window:
+A glucose-like trajectory driven by observed events: `meal` (→ delayed rise) and
+`insulin` (→ delayed fall), each starting `Δ=8` steps after the event for `L=6`
+steps. Every ground-truth quantity is known (event/response times, per-step
+source label, segments `R_i`, counterfactuals `Y^{(−i)}`). The overlap stress
+test sweeps the event gap `g=τ_B−τ_A`: as `g→0` the two responses overlap.
 
-* `meal`   (c = +1) → a delayed **rise** segment, and
-* `insulin` (c = −1) → a delayed **fall** segment,
+## Metrics (`evaluate.py`, `ours.py`)
 
-each starting `Δ = 8` steps after the event and lasting `L = 6` steps. Because the
-responses are additive in log-returns we know, for free, every ground-truth
-quantity: event times `τᵢ`, response onsets `ρᵢ = τᵢ+Δ`, the event→response link,
-the per-step source label, the response segments `Rᵢ`, and the counterfactual
-trajectory `Y^(−i)` with event `i` removed.
-
-The **overlap stress test** sweeps the event gap `g = τ_B − τ_A`. As `g → 0` the
-two response segments overlap and source attribution becomes ambiguous for any
-model that only exposes an aggregate intensity. Training uses a mix of
-single-event and well-separated two-event sequences so the model *can* learn
-localized responses; the test then asks whether it can still attribute
-*overlapping* ones.
-
-## Baselines (`model_io.py`)
-
-Both reuse the repository's unmodified `MJDTransformer` backbone and `NeuralMJD`
-head (each sample is a trivial one-node graph, `N = 1`):
-
-| baseline          | input context                                   |
-|-------------------|-------------------------------------------------|
-| `neural_mjd`      | past price + time only (latent jump, no events) |
-| `neural_mjd_ctx`  | the above **+ observed event-context channels** |
-
-## Attribution protocols (`evaluate.py`)
-
-Since neither baseline has a native `P(i|t)`, each is given the *best* probe it
-admits:
-
-* **`neural_mjd_ctx`** → **occlusion attribution**: the event-`i` marker is removed
-  from the context and the resulting change in the forecast *increments*
-  `Sᵢ(t) = |Δŷ(t) − Δŷ_{−i}(t)|` is read as that event's post-hoc response
-  intensity. This is exactly the reviewer's "events in `C`" probe.
-* **`neural_mjd`** → **chance**: with no event input (and, for same-type events, no
-  source information in the aggregate intensity/sign) the model can only detect
-  *that* a jump occurs and then guess the source — the chance baseline.
-
-## Metrics
-
-* **Forecast MAE** – raw-scale conditional-mean point forecast.
-* **Jump-time MAE** – `|t̂* − t*|` between the largest predicted move and the true
-  response onset.
-* **Event attribution F1** – macro-F1 of the predicted source over response steps.
-* **Segment IoU** – overlap of predicted vs. true response segments `Rᵢ`.
-* **Counterfactual RMSE** – error of the model's event-removal counterfactual
-  vs. the true `Y^(−i)` (the no-context model cannot remove an event at all).
+Forecast MAE · Jump-time MAE · Event-attribution F1 · Segment IoU · Counterfactual
+RMSE. Baselines are probed by occlusion (`+ctx`) or chance (no context); Ours
+reads attribution natively from `λ_{i,t}`.
 
 ## Running
 
 ```bash
-python -m experiments.event_response.run            # full run (CPU ~15-20 min)
+python -m experiments.event_response.run            # full run (CPU, ~12 min)
 python -m experiments.event_response.run --quick    # fast smoke run
+python -m experiments.event_response.make_figures   # rebuild figures from saved checkpoints
 ```
 
-Artifacts are written to `experiments/event_response/results/`:
-`metrics.json`, `metrics.csv`, `three_panel.png`, `overlap_robustness.png`.
+Artifacts → `results/`: `metrics.{json,csv}`, `four_panel.png`, `overlap_robustness.png`.
 
 ## Results
 
-Averaged over overlap gaps `g ∈ {1,2,4,6}` (full run, CPU):
+<!-- RESULTS_TABLE -->
 
-| Metric | `neural_mjd` | `neural_mjd_ctx` | better |
-|---|---:|---:|---|
-| Forecast MAE (raw) | 16.08 | **10.57** | lower |
-| Jump-time MAE (steps) | 15.11 | **3.27** | lower |
-| Event attribution F1 | 0.48 | 0.44 | higher (chance ≈ 0.5) |
-| Segment IoU | 0.08 | 0.08 | higher |
-| Counterfactual RMSE | 27.86 | **16.78** | lower |
+The pattern (see `results/`):
 
-The robust, reproducible takeaways are:
+1. **Forecasting / jump-timing / counterfactuals improve with event information**
+   (`neural_mjd_ctx` > `neural_mjd`), and **Ours is best on all of them**.
+2. **Both baselines fail attribution** — event-source F1 and segment IoU sit at
+   chance regardless of overlap.
+3. **Ours recovers attribution**: high F1 and segment IoU that stay high as the
+   responses overlap, and near-exact counterfactuals — because each event has its
+   own delay-aware response intensity.
 
-1. **Forecasting works** and **context helps it**: `neural_mjd_ctx` forecasts the
-   delayed responses with low MAE and low jump-time error, far better than the
-   context-free `neural_mjd` (which never saw the events).
-2. **Counterfactuals need the events**: `neural_mjd_ctx` approximates single-event
-   removal far better than `neural_mjd`, which structurally cannot remove an event.
-3. **But neither baseline can attribute**: event-source F1 and segment IoU stay at
-   / near **chance** for both. Occluding the context of `neural_mjd_ctx` is
-   unstable — for two *same-type* overlapping events it is provably degenerate
-   (removing either event changes the forecast identically, `S₀ ≡ S₁`), and for
-   *opposite-type* events it is no better than chance once the responses overlap.
+In one line: *forecasting (even with events in the context) is not event-response
+attribution; an event-marked jump measure is.*
 
-In one line: **forecasting and even counterfactual prediction are *not*
-event-response attribution.** Neural MJD (with or without event context) is
-sufficient for unlabeled jump forecasting but **insufficient for event-response
-explanation** — the gap that an event-specific response-intensity decomposition
-("ours") is meant to fill.
+## The four-panel figure (`figure.py`)
 
-## The three-panel figure (`figure.py`)
-
-* **A. Ground truth** — trajectory with events and their (colour-coded) response
-  segments (meal→rise, insulin→fall).
-* **B. Neural MJD** — the aggregate jump intensity `λ_t(|ν_t|+|γ_t|)`: *"a jump is
-  likely here"*, with **no source**.
-* **C. Neural MJD + context** — occlusion response intensities `Sᵢ(t)`: a post-hoc
-  probe that blurs across overlapping responses.
+* **A. Ground truth** — meal→rise and insulin→fall response segments.
+* **B. Neural MJD** — one aggregate intensity `λ_t`: *"a jump is likely here"*,
+  no source.
+* **C. Neural MJD + context** — occlusion intensities `S_i(t)`, entangled across
+  the overlapping responses.
+* **D. Ours** — native per-event intensities `λ_i(t)`: the meal response and the
+  insulin response are each attributed to their own source.

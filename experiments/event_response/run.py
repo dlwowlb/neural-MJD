@@ -1,14 +1,13 @@
 """
-Run the overlapping event-response baseline experiment.
+Run the full event-response experiment: two Neural MJD baselines plus Ours.
 
-Trains two baselines on the synthetic benchmark and reports forecasting + event-
-response attribution metrics across a sweep of event-overlap levels:
+Trains, on the synthetic benchmark, and reports forecasting + event-response
+attribution metrics across a sweep of event-overlap levels:
 
-    1. neural_mjd       Neural MJD with no event context (latent jump only)
+    1. neural_mjd       Neural MJD, no event context (latent jump only)
     2. neural_mjd_ctx   Neural MJD with the observed events fed into context C
-
-("Ours" -- event-specific response intensity decomposition -- is intentionally
-left out here; this script establishes the baseline behaviour.)
+    3. ours             Event-Marked Neural MJD (per-source delay-aware
+                        intensity + magnitude, native attribution)
 
 Usage:
     python -m experiments.event_response.run            # full run
@@ -24,6 +23,7 @@ import torch
 from .synthetic import make_dataset, make_train_dataset
 from . import model_io as mio
 from . import evaluate as ev
+from . import ours as ours_mod
 from . import figure as fig
 
 
@@ -32,6 +32,7 @@ from . import figure as fig
 # overlap (g=1) to fully separated responses (g=6, since RESPONSE_DUR=6).
 GAPS = [1, 2, 4, 6]
 BASELINES = [("neural_mjd", False), ("neural_mjd_ctx", True)]
+METHODS = ["neural_mjd", "neural_mjd_ctx", "ours"]
 
 
 def run(quick=False, seed=0, out_dir=None):
@@ -75,17 +76,31 @@ def run(quick=False, seed=0, out_dir=None):
                   f"jumpMAE={m['jump_time_mae']:.2f} F1={m['attr_f1']:.3f} "
                   f"IoU={m['segment_iou']:.3f} cfRMSE={m['counterfactual_rmse']:.3f}")
 
+    # --- Ours: Event-Marked Neural MJD --------------------------------------
+    print("\n=== Training Ours: Event-Marked Neural MJD ===")
+    ours_model = ours_mod.EventMarkedMJD(hidden=128 if not quick else 64).to(device)
+    ours_mod.train_ours(ours_model, train_seqs, device, epochs=epochs, lr=2e-3)
+    torch.save({"state_dict": ours_model.state_dict(),
+                "hidden": 128 if not quick else 64}, os.path.join(out_dir, "ours.pth"))
+    results["ours"] = {}
+    for g in GAPS:
+        m = ours_mod.evaluate_ours(ours_model, test_sets[g], device)
+        results["ours"][g] = m
+        print(f"  gap={g}: forecastMAE={m['forecast_mae']:.3f} "
+              f"jumpMAE={m['jump_time_mae']:.2f} F1={m['attr_f1']:.3f} "
+              f"IoU={m['segment_iou']:.3f} cfRMSE={m['counterfactual_rmse']:.3f}")
+
     _print_summary(results)
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(results, f, indent=2)
     _write_csv(results, os.path.join(out_dir, "metrics.csv"))
 
-    # qualitative 3-panel figure on one representative overlapping example
+    # qualitative 4-panel figure on one representative overlapping example
     # (meal->rise + insulin->fall, matching the opposite-type benchmark)
     example = fig.pick_example(gap=3, seed=7)
-    fig.three_panel(example, models[("neural_mjd", False)],
-                    models[("neural_mjd_ctx", True)], device,
-                    os.path.join(out_dir, "three_panel.png"))
+    fig.four_panel(example, models[("neural_mjd", False)],
+                   models[("neural_mjd_ctx", True)], ours_model, device,
+                   os.path.join(out_dir, "four_panel.png"))
     fig.overlap_robustness(results, GAPS, os.path.join(out_dir, "overlap_robustness.png"))
     print(f"\nArtifacts written to {out_dir}/")
     return results
@@ -101,18 +116,18 @@ def _print_summary(results):
             ("attr_f1", "Event attribution F1", "higher"),
             ("segment_iou", "Segment IoU", "higher"),
             ("counterfactual_rmse", "Counterfactual RMSE", "lower")]
-    names = [n for n, _ in BASELINES]
-    print("\n" + "=" * 72)
+    names = [n for n in METHODS if n in results]
+    print("\n" + "=" * 84)
     print("SUMMARY (averaged over overlap gaps {})".format(GAPS))
-    print("=" * 72)
-    print(f"{'Metric':<28}" + "".join(f"{n:>22}" for n in names) + "   better")
+    print("=" * 84)
+    print(f"{'Metric':<26}" + "".join(f"{n:>18}" for n in names) + "   better")
     for key, label, better in keys:
-        row = f"{label:<28}"
+        row = f"{label:<26}"
         for n in names:
-            row += f"{_avg_over_gaps(results, n, key):>22.3f}"
+            row += f"{_avg_over_gaps(results, n, key):>18.3f}"
         row += f"   {better}"
         print(row)
-    print("=" * 72)
+    print("=" * 84)
     print("Overlap robustness (event attribution F1 as gap -> 0):")
     for n in names:
         vals = "  ".join(f"g{g}:{results[n][g]['attr_f1']:.2f}" for g in GAPS)
@@ -122,7 +137,7 @@ def _print_summary(results):
 def _write_csv(results, path):
     keys = ["forecast_mae", "jump_time_mae", "attr_f1", "segment_iou", "counterfactual_rmse"]
     with open(path, "w") as f:
-        f.write("baseline,gap," + ",".join(keys) + "\n")
+        f.write("method,gap," + ",".join(keys) + "\n")
         for name in results:
             for g in results[name]:
                 row = [name, str(g)] + [f"{results[name][g][k]:.4f}" for k in keys]

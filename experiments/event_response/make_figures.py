@@ -10,11 +10,12 @@ import json
 import torch
 
 from . import model_io as mio
+from . import ours as ours_mod
 from . import figure as fig
 from .run import GAPS
 
 
-def _load(out_dir, name):
+def _load_baseline(out_dir, name):
     ckpt = torch.load(os.path.join(out_dir, f"{name}.pth"), map_location="cpu")
     model = mio.build_model(in_seq_dim=ckpt["in_dim"], feature_dims=ckpt["feat"],
                             num_layers=2, num_heads=4)
@@ -23,15 +24,24 @@ def _load(out_dir, name):
     return model
 
 
+def _load_ours(out_dir):
+    ckpt = torch.load(os.path.join(out_dir, "ours.pth"), map_location="cpu")
+    model = ours_mod.EventMarkedMJD(hidden=ckpt["hidden"])
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    return model
+
+
 def main():
     out_dir = os.path.join(os.path.dirname(__file__), "results")
     device = torch.device("cpu")
-    plain = _load(out_dir, "neural_mjd")
-    ctx = _load(out_dir, "neural_mjd_ctx")
+    plain = _load_baseline(out_dir, "neural_mjd")
+    ctx = _load_baseline(out_dir, "neural_mjd_ctx")
+    ours_model = _load_ours(out_dir)
 
     example = fig.pick_example(gap=3, seed=7)
-    fig.three_panel(example, plain, ctx, device,
-                    os.path.join(out_dir, "three_panel.png"))
+    fig.four_panel(example, plain, ctx, ours_model, device,
+                   os.path.join(out_dir, "four_panel.png"))
 
     with open(os.path.join(out_dir, "metrics.json")) as f:
         results = json.load(f)
