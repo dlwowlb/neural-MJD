@@ -58,5 +58,35 @@
       "segment_iou": 0.06788546197725885,
       "counterfactual_rmse": 17.57809829711914
     }
+  },
+  "ours": {
+    "1": {
+      "forecast_mae": 0.46780505776405334,
+      "jump_time_mae": 0.0,
+      "attr_f1": 0.9031250000000001,
+      "segment_iou": 0.625,
+      "counterfactual_rmse": 0.6417604684829712
+    },
+    "2": {
+      "forecast_mae": 0.4945422112941742,
+      "jump_time_mae": 0.3359375,
+      "attr_f1": 1.0,
+      "segment_iou": 0.75,
+      "counterfactual_rmse": 0.6721824407577515
+    },
+    "4": {
+      "forecast_mae": 0.5200803279876709,
+      "jump_time_mae": 1.2421875,
+      "attr_f1": 1.0,
+      "segment_iou": 1.0,
+      "counterfactual_rmse": 0.6973559260368347
+    },
+    "6": {
+      "forecast_mae": 0.49587592482566833,
+      "jump_time_mae": 0.8203125,
+      "attr_f1": 1.0,
+      "segment_iou": 1.0,
+      "counterfactual_rmse": 0.6622210741043091
+    }
   }
 }

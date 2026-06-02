@@ -88,7 +88,24 @@ Artifacts → `results/`: `metrics.{json,csv}`, `four_panel.png`, `overlap_robus
 
 ## Results
 
-<!-- RESULTS_TABLE -->
+Averaged over overlap gaps `g ∈ {1,2,4,6}` (full run, CPU):
+
+| Metric | `neural_mjd` | `neural_mjd_ctx` | **`ours`** | better |
+|---|---:|---:|---:|---|
+| Forecast MAE (raw) | 16.08 | 10.57 | **0.50** | lower |
+| Jump-time MAE (steps) | 15.11 | 3.27 | **0.60** | lower |
+| Event attribution F1 | 0.48 | 0.44 | **0.98** | higher |
+| Segment IoU | 0.08 | 0.08 | **0.84** | higher |
+| Counterfactual RMSE | 27.86 | 16.78 | **0.67** | lower |
+
+Overlap robustness — event attribution F1 as the responses overlap (`g→1`):
+
+| method | g=6 | g=4 | g=2 | g=1 |
+|---|---:|---:|---:|---:|
+| `neural_mjd` | 0.49 | 0.48 | 0.47 | 0.46 |
+| `neural_mjd_ctx` | 0.39 | 0.43 | 0.47 | 0.47 |
+| **`ours`** | **1.00** | **1.00** | **1.00** | **0.90** |
+
 
 The pattern (see `results/`):
 

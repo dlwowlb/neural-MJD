@@ -1,4 +1,4 @@
-baseline,gap,forecast_mae,jump_time_mae,attr_f1,segment_iou,counterfactual_rmse
+method,gap,forecast_mae,jump_time_mae,attr_f1,segment_iou,counterfactual_rmse
 neural_mjd,1,14.8031,14.9297,0.4636,0.0842,27.8285
 neural_mjd,2,15.3203,15.0195,0.4746,0.0839,27.9014
 neural_mjd,4,16.3620,15.2930,0.4847,0.0803,27.7949
@@ -7,3 +7,7 @@ neural_mjd_ctx,1,8.9602,3.2227,0.4691,0.0803,16.3938
 neural_mjd_ctx,2,9.5080,3.1719,0.4683,0.0791,16.4125
 neural_mjd_ctx,4,10.8377,3.2812,0.4273,0.0817,16.7264
 neural_mjd_ctx,6,12.9528,3.3828,0.3889,0.0679,17.5781
+ours,1,0.4678,0.0000,0.9031,0.6250,0.6418
+ours,2,0.4945,0.3359,1.0000,0.7500,0.6722
+ours,4,0.5201,1.2422,1.0000,1.0000,0.6974
+ours,6,0.4959,0.8203,1.0000,1.0000,0.6622
