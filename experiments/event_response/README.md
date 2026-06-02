@@ -91,9 +91,19 @@ python -m experiments.event_response.run --quick    # fast smoke run
 Artifacts are written to `experiments/event_response/results/`:
 `metrics.json`, `metrics.csv`, `three_panel.png`, `overlap_robustness.png`.
 
-## What the results show
+## Results
 
-See `results/` after a run. The robust, reproducible takeaways are:
+Averaged over overlap gaps `g ∈ {1,2,4,6}` (full run, CPU):
+
+| Metric | `neural_mjd` | `neural_mjd_ctx` | better |
+|---|---:|---:|---|
+| Forecast MAE (raw) | 16.08 | **10.57** | lower |
+| Jump-time MAE (steps) | 15.11 | **3.27** | lower |
+| Event attribution F1 | 0.48 | 0.44 | higher (chance ≈ 0.5) |
+| Segment IoU | 0.08 | 0.08 | higher |
+| Counterfactual RMSE | 27.86 | **16.78** | lower |
+
+The robust, reproducible takeaways are:
 
 1. **Forecasting works** and **context helps it**: `neural_mjd_ctx` forecasts the
    delayed responses with low MAE and low jump-time error, far better than the

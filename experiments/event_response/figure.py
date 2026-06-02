@@ -98,17 +98,26 @@ def three_panel(seq, model_plain, model_ctx, device, path):
 
 def overlap_robustness(results, gaps, path):
     fig, axes = plt.subplots(1, 3, figsize=(12, 3.6))
-    metrics = [("attr_f1", "Event attribution F1", "higher better"),
-               ("segment_iou", "Segment IoU", "higher better"),
-               ("counterfactual_rmse", "Counterfactual RMSE", "lower better")]
-    for ax, (key, label, note) in zip(axes, metrics):
+    # (key, label, note, ylim, chance-level reference or None)
+    metrics = [("attr_f1", "Event attribution F1", "higher better", (0.3, 1.0), 0.5),
+               ("segment_iou", "Segment IoU", "higher better", (0.0, 0.6), None),
+               ("counterfactual_rmse", "Counterfactual RMSE", "lower better", None, None)]
+    for ax, (key, label, note, ylim, chance) in zip(axes, metrics):
         for name in results:
             ys = [results[name][g][key] for g in gaps]
             ax.plot(gaps, ys, marker="o", label=name)
+        if chance is not None:
+            ax.axhline(chance, color="grey", ls="--", lw=1)
+            ax.text(gaps[-1], chance, " chance", va="bottom", ha="right",
+                    fontsize=8, color="grey")
+        if ylim is not None:
+            ax.set_ylim(*ylim)
         ax.set_title(f"{label}\n({note})", fontsize=10)
         ax.set_xlabel("event gap  (smaller = more overlap)")
         ax.grid(alpha=0.3)
-    axes[0].legend(fontsize=8)
-    fig.tight_layout()
+    axes[0].legend(fontsize=8, loc="lower left")
+    fig.suptitle("Attribution (left two) stays at chance for both baselines; "
+                 "only counterfactual RMSE separates them.", fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(path, dpi=130)
     plt.close(fig)
