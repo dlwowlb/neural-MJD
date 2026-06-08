@@ -112,14 +112,18 @@ class EventFieldMJD(nn.Module):
         # softmax pi (eqs. 15/47) and trace psi (eq. 14) receive a gradient:
         # the *collapsed* NLL (eqs. 53-58) marginalises event identity and gives
         # pi no signal on its own. See README "identifiability" note.
-        self.rho_head = mlp([d_evt, d_evt, 1])
+        self.rho_head = mlp([d_evt + d_z + d_h, d_evt, 1])
 
         # --- Jump magnitude heads (eqs. 23-26): each outputs (nu, gamma_raw)
         self.m_bg = mlp([d_h, d_h, 2])
         self.m_resp = mlp([d_z + d_h, d_h, 2])
 
-        # --- Drift / diffusion (eq. 28): outputs (mu, sigma_raw)
-        self.p_theta = mlp([d_h + d_z, d_h, 2])
+        # --- Drift / diffusion (eq. 28): mu, sigma = p_theta^Y(h_t^Y).
+        # Trajectory-only history: the smooth drift/diffusion must NOT see events
+        # (directly or via Z), otherwise it absorbs event-driven increments and
+        # the response/attribution channel gets no work (endogenous vs exogenous
+        # separation).
+        self.p_theta = mlp([d_h, d_h, 2])
 
         # Precompute truncated count grid (eq. 57): {(k_bg,k_resp): sum<=kappa}
         pairs = [(a, b) for a in range(kappa_trunc + 1)
@@ -186,11 +190,12 @@ class EventFieldMJD(nn.Module):
         """Compute the piecewise-constant interval parameters for j=0..T-1.
 
         Returns a dict of [B, T] tensors (and intensities)."""
-        h = h_grid[:, :-1]      # context at interval start (predictable)
+        h = h_grid[:, :-1]      # trajectory-only context at interval start (predictable)
         Z = Z_grid[:, :-1]
         hz = torch.cat([h, Z], dim=-1)
 
-        mu_raw, sig_raw = self.p_theta(hz).chunk(2, dim=-1)                 # eq. 28
+        # drift/diffusion: trajectory-only (h^Y), events excluded by design (eq. 28)
+        mu_raw, sig_raw = self.p_theta(h).chunk(2, dim=-1)
         mu = self.bound_mu * torch.tanh(mu_raw.squeeze(-1))
         sigma = self.bound_sigma * torch.sigmoid(sig_raw.squeeze(-1)) + 1e-3
 
@@ -257,8 +262,10 @@ class EventFieldMJD(nn.Module):
         # if no active events, softmax over all -inf is uniform; force to 0
         pi_bar = torch.where(has_active.unsqueeze(-1), pi_bar, torch.zeros_like(pi_bar))
 
-        # event-specific signed response magnitude rho_{i,j} from the trace
-        rho = self.bound_nu * torch.tanh(self.rho_head(zeta).squeeze(-1))    # [B,T,M]
+        # event-specific signed response magnitude rho_{i,j} = rho_max * tanh(
+        #   r_theta(zeta_i, Z_t, h_t) ) -- conditions on the current field/history
+        rho = self.bound_nu * torch.tanh(
+            self.rho_head(torch.cat([zeta, Z_t, h_t], dim=-1)).squeeze(-1))   # [B,T,M]
         return pi_bar, active, has_active.float(), rho
 
     # ------------------------------------------------------------------ #

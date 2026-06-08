@@ -135,9 +135,9 @@ def evaluate(model, data, device, batch_size):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--num_samples", type=int, default=768)
-    ap.add_argument("--epochs", type=int, default=120)
+    ap.add_argument("--epochs", type=int, default=250)
     ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--kappa_trunc", type=int, default=4)
     ap.add_argument("--no_plot", action="store_true")

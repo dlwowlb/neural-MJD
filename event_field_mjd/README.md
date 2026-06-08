@@ -30,20 +30,28 @@ python validate.py                 # full run (~120 epochs, CPU-friendly)
 python validate.py --epochs 30 --num_samples 256 --no_plot   # quick check
 ```
 
-## Representative result (120 epochs, CPU, held-out test set)
+## Representative result (250 epochs, CPU, held-out test set)
 
 | metric | value | reading |
 |--------|-------|---------|
-| NLL / interval | **−2.29** | likelihood converges |
-| one-step MAE (raw `S`) | **1.87** | ≈1.9 % on an `S≈100` scale |
-| attribution corr `R` vs GT | **0.77** (shuffle −0.03) | per-event signed response recovered |
+| NLL / interval | **−2.31** | likelihood converges |
+| one-step MAE (raw `S`) | **1.9** | ≈1.9 % on an `S≈100` scale |
+| attribution corr `R` vs GT | **0.68** (shuffle −0.02) | per-event signed response recovered |
 | event sign accuracy | **0.83** | up/down direction recovered |
-| response localization (`K_resp`) | **0.57** | response jumps land where events act |
-| background separation (`K_bg`) | **0.79** | background jumps land on real ones |
+| response localization (`K_resp`) | **0.4–0.5** | response jumps land where events act |
+| background separation (`K_bg`) | **0.55** | background jumps land on real ones |
 
 The attribution scatter (`outputs/03_attribution_scatter.png`) is clearly
 monotonic; magnitude is somewhat attenuated because `R = K_resp · π̄ · ρ` with
-`E[K_resp] < 1`. Exact numbers vary a little with `--seed`.
+`E[K_resp] < 1`. Exact numbers vary with `--seed`.
+
+> **Convergence note.** Because drift/diffusion is *trajectory-only* (events
+> enter only through `Z`), the response channel has to carry every event effect,
+> which makes attribution converge slowly — it passes through an anti-correlated
+> phase before locking on. ~200–250 epochs are needed for the attribution
+> metrics to settle (forecast/NLL converge much earlier). Letting drift also see
+> `Z` speeds this up to ~120 epochs but violates the endogenous/exogenous split,
+> so we keep the faithful version.
 
 ## What is validated
 
@@ -98,7 +106,7 @@ whenever active events are reasonably separated in time — which is what lifts
 | (14) event trace `ζ_i(t)` | `model.attribution_shares` (`psi`) |
 | (15–16, 47) attribution share `π_i` / `π̄_{i,j}` | `model.attribution_shares` (masked softmax) |
 | (23–26) jump magnitudes | `model.interval_params` (`m_bg`, `m_resp`) |
-| (28) drift/diffusion | `model.interval_params` (`p_theta`) |
+| (28) drift/diffusion `μ,σ = p_θ^Y(h_t^Y)` | `model.interval_params` (`p_theta`, trajectory-only) |
 | (29) compensator `κ_t` | `model._collapsed_terms` |
 | (54–55) collapsed mean/variance | `model._collapsed_terms` (`a`, `b2`) |
 | (57) truncated count set | `EventFieldMJD.__init__` (`k_bg_grid`, `k_resp_grid`) |
