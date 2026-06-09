@@ -72,6 +72,8 @@ def generate_dataset(
     mr_rate=0.10,          # mean-reversion rate of the drift
     sigma_diff=0.01,       # diffusion sigma (log-space, per sqrt(time))
     mag_scale=1.0,         # global multiplier on response magnitude mean
+    max_delay=2.0,         # per-event response onset delay ~ U(0, max_delay)
+    personal_scale_sigma=0.2,  # per-subject latent effect scaling (unseen by model)
     baseline_log_range=(math.log(80.0), math.log(120.0)),
     seed=0,
 ):
@@ -93,10 +95,18 @@ def generate_dataset(
     gt_K_resp = np.zeros((num_samples, T), dtype=np.float32)        # total response count
     gt_K_bg = np.zeros((num_samples, T), dtype=np.float32)          # background count
     gt_bg_R = np.zeros((num_samples, T), dtype=np.float32)          # signed background contribution
+    gt_delay = np.zeros((num_samples, M_max), dtype=np.float32)     # per-event onset delay
+    gt_amp = np.zeros((num_samples, M_max), dtype=np.float32)       # per-event signed effect mean (nu_i)
+    gt_event_type = -np.ones((num_samples, M_max), dtype=np.int64)  # per-event type index
+    gt_baseline = np.zeros((num_samples,), dtype=np.float32)        # per-subject log baseline
 
     horizon = T * dt
     for b in range(num_samples):
         baseline = rng.uniform(*baseline_log_range)
+        gt_baseline[b] = baseline
+        # per-subject latent gain that the model never observes -> the event
+        # feature (type, magnitude) no longer fully reveals the response.
+        personal = float(rng.lognormal(0.0, personal_scale_sigma))
         n_evt = int(rng.integers(n_events_range[0], n_events_range[1] + 1))
 
         # ---- Step 1: events (time, type, magnitude), off the sensor grid
@@ -104,24 +114,31 @@ def generate_dataset(
         taus = taus + 0.5 * dt * rng.uniform(-0.4, 0.4, size=n_evt)
         type_idx = rng.integers(0, n_types, size=n_evt)
         mags = rng.uniform(0.5, 1.5, size=n_evt)
+        delays = rng.uniform(0.0, max_delay, size=n_evt)       # per-event onset delay
 
         tau[b, :n_evt] = taus
         for i in range(n_evt):
             x_feat[b, i, type_idx[i]] = 1.0           # one-hot type
-            x_feat[b, i, n_types] = mags[i]           # magnitude
+            x_feat[b, i, n_types] = mags[i]           # magnitude (observed)
         evt_mask[b, :n_evt] = 1.0
+        gt_delay[b, :n_evt] = delays
+        gt_event_type[b, :n_evt] = type_idx
 
-        # ---- Step 2: per-event response kernels g_i on the fine grid
+        # ---- Step 2: per-event response kernels g_i on the fine grid.
+        # Response starts only after an onset delay and is hard-windowed to
+        # 0 < (t - tau_i - delay_i) < W (explicit attribution window).
         g = np.zeros((n_evt, n_fine + 1), dtype=np.float64)     # [n_evt, n_fine+1]
         nu_i = np.zeros(n_evt)                                  # per-event signed magnitude mean
         for i in range(n_evt):
             ctype = EVENT_TYPES[type_idx[i]]
             alpha, nu, k, theta = TYPE_PARAMS[ctype]
-            u = t_fine - taus[i]
+            u = t_fine - taus[i] - delays[i]
             kern = _gamma_pdf(u, k, theta)
             kern[(u <= 0) | (u >= W)] = 0.0                     # window 0<u<W
             g[i] = alpha * mags[i] * kern
-            nu_i[i] = mag_scale * nu * mags[i]
+            # true signed effect mean: type sign x magnitude x latent personal gain
+            nu_i[i] = mag_scale * nu * mags[i] * personal
+        gt_amp[b, :n_evt] = nu_i
 
         # ---- Steps 3-4: response intensity and attribution share on fine grid
         g_sum = g.sum(axis=0)                                   # [n_fine+1]
@@ -181,9 +198,14 @@ def generate_dataset(
         "gt_K_resp": torch.from_numpy(gt_K_resp),              # [B, T] response count
         "gt_K_bg": torch.from_numpy(gt_K_bg),                  # [B, T] background count
         "gt_bg_R": torch.from_numpy(gt_bg_R),                  # [B, T] signed background contribution
+        "gt_delay": torch.from_numpy(gt_delay),                # [B, M] per-event onset delay
+        "gt_amp": torch.from_numpy(gt_amp),                    # [B, M] per-event signed effect mean
+        "gt_event_type": torch.from_numpy(gt_event_type),      # [B, M] type index (-1 = pad)
+        "gt_baseline": torch.from_numpy(gt_baseline),          # [B] log baseline
         "meta": {"T": T, "dt": dt, "W": W, "M_max": M_max,
                  "n_types": n_types, "x_feat_dim": n_types + 1,
-                 "event_types": EVENT_TYPES},
+                 "event_types": EVENT_TYPES, "max_delay": max_delay,
+                 "personal_scale_sigma": personal_scale_sigma},
     }
     return out
 

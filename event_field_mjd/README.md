@@ -37,10 +37,14 @@ dX_t = μ^GT dt + σ^GT dW_t + ∫ log y N^E(dt,dy,dr)
 ```
 
 Event types `{meal, insulin, exercise, stress}` have distinct **Gamma response
-kernels** (delayed peaks) and **signed magnitudes**; the model only sees
-`x_i = [onehot(type), m_i]` and must learn the sign/shape. Per sensor interval we
-store `K_bg^GT`, `K_resp^GT`, per-event `K_{i,j}^GT`, and the signed
-`R_{i,j}^GT = Σ log Y` of jumps marked `i`.
+kernels** (delayed peaks), a per-event **onset delay** `δ_i ~ U(0, max_delay)`
+(response is hard-windowed to `0 < t−τ_i−δ_i < W`), and **signed magnitudes**.
+A per-subject **latent gain** `personal ~ LogNormal(0, σ)` scales every effect
+but is *never shown to the model*, so the feature `x_i = [onehot(type), m_i]`
+no longer fully reveals the response (the model must infer sign/shape/scale).
+Per sensor interval we store `K_bg^GT`, `K_resp^GT`, per-event `K_{i,j}^GT`, and
+the signed `R_{i,j}^GT = Σ log Y`; per event we also store the true onset delay
+`gt_delay`, signed effect mean `gt_amp`, and type `gt_event_type`.
 
 ## Run
 
@@ -74,12 +78,15 @@ L = L_NLL  +  w_mean · L_route  +  w_rho · L_rho  +  w_ent · L_ent
 
 | metric | value | reading |
 |--------|-------|---------|
-| NLL / interval | **−2.53** | likelihood converges |
-| one-step MAE (raw `S`) | **2.9** | small on an `S` spanning ~40–430 |
-| attribution corr `R` vs GT | **0.83** (shuffle 0.06) | per-event signed response recovered |
+| NLL / interval | **−2.50** | likelihood converges |
+| one-step MAE (raw `S`) | **3.0** | small on an `S` spanning ~35–240 |
+| attribution corr `R` vs GT | **0.81** (shuffle 0.03) | per-event signed response recovered |
 | event sign accuracy | **0.99** | up/down direction recovered |
-| response localization (`K_resp` vs GT count) | **0.86** | recovers *how many* response jumps per interval |
-| background separation (`K_bg` vs GT count) | **0.65** | recovers background jump counts |
+| response localization (`K_resp` vs GT count) | **0.85** | recovers *how many* response jumps per interval |
+| background separation (`K_bg` vs GT count) | **0.61** | recovers background jump counts |
+
+(With per-event onset delay and a hidden per-subject gain enabled by default;
+turn them off via `max_delay=0`, `personal_scale_sigma=0` for the easiest setting.)
 
 The attribution scatter (`outputs/03_attribution_scatter.png`) now lies close to
 `y=x`: under the model-matched DGP both the **sign and magnitude** of each
