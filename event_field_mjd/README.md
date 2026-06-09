@@ -18,9 +18,29 @@ jump-diffusion mixture. Per-event attribution is then recovered as a
 
 | File | Purpose |
 |------|---------|
-| `synthetic.py` | Generates trajectories with known per-event log-response (`gt_R`) and background jumps (`gt_bg`). |
+| `synthetic.py` | **Event-conditioned marked-MJD** simulator: samples a marked latent jump counter `N^E(dt,dy,dr)` and saves ground-truth jump counts (`gt_K_resp`, `gt_K_bg`), per-event counts (`gt_K_evt`), and signed contributions (`gt_R`). |
 | `model.py` | `EventFieldMJD`: encoder, response field, intensities, attribution, collapsed truncated likelihood, posterior attribution. |
-| `validate.py` | Train on NLL + auxiliary mean loss, then report forecast quality **and** attribution recovery. Writes plots to `outputs/`. |
+| `validate.py` | Train on NLL + routed mean loss, then report forecast quality **and** attribution recovery. Writes plots to `outputs/`. |
+
+## Data-generating process (`synthetic.py`)
+
+Just as Neural-MJD validates on data drawn from an MJD, we draw from the
+**event-conditioned marked MJD** the model assumes — so every latent jump has a
+*source mark* and we have ground-truth attribution, not just a trajectory:
+
+```
+events e_i=(τ_i, c_i, m_i)  →  g_i(t)=α_{c_i} m_i K_{c_i}(t−τ_i)·1{0<t−τ_i<W}
+λ_resp^GT(t)=λ_min+Σ_i g_i(t)      π_i^GT(t)=g_i(t)/Σ_l g_l(t)
+N^E(dt,dy,{i}) ~ λ_resp^GT π_i^GT f_i      N^E(dt,dy,{0}) ~ λ_bg^GT f_bg
+log Y_i ~ N(ν_{c_i} m_i, γ_resp²)   (meal/stress>0, insulin/exercise<0)
+dX_t = μ^GT dt + σ^GT dW_t + ∫ log y N^E(dt,dy,dr)
+```
+
+Event types `{meal, insulin, exercise, stress}` have distinct **Gamma response
+kernels** (delayed peaks) and **signed magnitudes**; the model only sees
+`x_i = [onehot(type), m_i]` and must learn the sign/shape. Per sensor interval we
+store `K_bg^GT`, `K_resp^GT`, per-event `K_{i,j}^GT`, and the signed
+`R_{i,j}^GT = Σ log Y` of jumps marked `i`.
 
 ## Run
 
@@ -54,16 +74,18 @@ L = L_NLL  +  w_mean · L_route  +  w_rho · L_rho  +  w_ent · L_ent
 
 | metric | value | reading |
 |--------|-------|---------|
-| NLL / interval | **−2.29** | likelihood converges |
-| one-step MAE (raw `S`) | **1.82** | ≈1.8 % on an `S≈100` scale |
-| attribution corr `R` vs GT | **0.66** (shuffle −0.03) | per-event signed response recovered |
-| event sign accuracy | **0.88** | up/down direction recovered |
-| response localization (`K_resp`) | **0.3–0.4** | response jumps land where events act |
-| background separation (`K_bg`) | **0.56** | background jumps land on real ones |
+| NLL / interval | **−2.53** | likelihood converges |
+| one-step MAE (raw `S`) | **2.9** | small on an `S` spanning ~40–430 |
+| attribution corr `R` vs GT | **0.83** (shuffle 0.06) | per-event signed response recovered |
+| event sign accuracy | **0.99** | up/down direction recovered |
+| response localization (`K_resp` vs GT count) | **0.86** | recovers *how many* response jumps per interval |
+| background separation (`K_bg` vs GT count) | **0.65** | recovers background jump counts |
 
-The attribution scatter (`outputs/03_attribution_scatter.png`) is clearly
-monotonic; magnitude is somewhat attenuated because `R = K_resp · π̄ · ρ` with
-`E[K_resp] < 1`. Exact numbers vary with `--seed`.
+The attribution scatter (`outputs/03_attribution_scatter.png`) now lies close to
+`y=x`: under the model-matched DGP both the **sign and magnitude** of each
+event's signed log-response are recovered (the cluster at `x≈0` is events that
+happened to fire no response jumps, i.e. no signal to attribute).
+Exact numbers vary with `--seed`.
 
 > **Convergence note.** Because drift/diffusion is *trajectory-only* (events
 > enter only through `Z`), the response channel has to carry every event effect,
@@ -72,6 +94,13 @@ monotonic; magnitude is somewhat attenuated because `R = K_resp · π̄ · ρ` w
 > metrics to settle (forecast/NLL converge much earlier). Letting drift also see
 > `Z` speeds this up to ~120 epochs but violates the endogenous/exogenous split,
 > so we keep the faithful version.
+
+> **Validation scope.** This is the **Level-1, model-matched** check: the DGP
+> obeys the model's own assumptions, so strong recovery is the *expected* sanity
+> result, not evidence of robustness. Natural follow-ups are Level-2
+> (semi-misspecified: smooth responses, skewed magnitudes, subject-varying delay,
+> noisy/missing event labels) and Level-3 (real-data-informed observation gaps,
+> event rates, baselines) — those stress-test attribution rather than confirm it.
 
 ## What is validated
 
