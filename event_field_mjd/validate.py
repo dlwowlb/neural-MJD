@@ -46,6 +46,7 @@ def iterate_batches(data, batch_size, shuffle, device, generator=None):
             "x_feat": data["x_feat"][sel],
             "evt_mask": data["evt_mask"][sel],
             "gt_R": data["gt_R"][sel],
+            "gt_K_evt": data["gt_K_evt"][sel],
             "gt_K_resp": data["gt_K_resp"][sel],
             "gt_K_bg": data["gt_K_bg"][sel],
             "grid": data["grid"],
@@ -61,76 +62,169 @@ def pearson(x, y):
 
 
 @torch.no_grad()
+def multi_horizon_mae(forecaster, data, device, batch_size, horizons, start_frac=0.4):
+    """Autoregressive multi-step forecast MAE (raw S) at the given horizons.
+
+    ``forecaster`` exposes ``rollout_forecast(batch, start_j, horizon)``.
+    """
+    Tp1 = data["X"].shape[1]
+    start_j = int(start_frac * (Tp1 - 1))
+    Hmax = min(max(horizons), Tp1 - 1 - start_j)
+    err = {h: 0.0 for h in horizons}
+    cnt = 0
+    for batch in iterate_batches(data, batch_size, shuffle=False, device=device):
+        preds = forecaster.rollout_forecast(batch, start_j, Hmax)          # [B, Hmax]
+        true = batch["X"][:, start_j + 1: start_j + 1 + Hmax]
+        ae = (torch.exp(preds) - torch.exp(true)).abs()                    # [B, Hmax]
+        cnt += ae.shape[0]
+        for h in horizons:
+            if h <= Hmax:
+                err[h] += float(ae[:, h - 1].sum())
+    return {h: err[h] / max(cnt, 1) for h in horizons if h <= Hmax}
+
+
+@torch.no_grad()
 def evaluate(model, data, device, batch_size):
+    import metrics as M
     model.eval()
     nll_sum, mean_se_sum, n_interval = 0.0, 0.0, 0
     mae_sum, mae_count = 0.0, 0
-
-    R_model, R_gt = [], []          # per active event, summed over its window
     sign_correct, sign_total = 0, 0
-    kbg_model, kbg_gt = [], []
-    kresp_model, resp_gt = [], []   # response localization per interval
 
+    R_model, R_gt = [], []
+    kbg_model, kbg_gt, kresp_model, resp_gt = [], [], [], []
+    A_all, gtKevt_all, active_all, mask_all, tau_all, mag_all = [], [], [], [], [], []
+    pnll_resp_sum, pnll_bg_sum, pnll_n = 0.0, 0.0, 0
+    R_mae_sum, R_mae_n = 0.0, 0
+
+    n_types = data["meta"]["n_types"]
     for batch in iterate_batches(data, batch_size, shuffle=False, device=device):
-        loss, cache = model.forward(batch)
+        _, cache = model.forward(batch)
         nll_sum += float(cache["nll"].sum())
         mean_se_sum += float(cache["mean_loss"].sum())
         n_interval += cache["nll"].numel()
 
-        # one-step forecast MAE in raw S space (exp of predicted next log-state)
         s_pred = torch.exp(cache["mean_pred"])
         s_true = torch.exp(batch["X"][:, 1:])
         mae_sum += float((s_pred - s_true).abs().sum())
         mae_count += s_true.numel()
 
         attr = model.attribute(batch)
-        R_hat = attr["R_hat"]                       # [B, M, T]
-        gt_R = batch["gt_R"]                        # [B, M, T]
-        evt_mask = batch["evt_mask"]                # [B, M]
+        R_hat, gt_R, evt_mask = attr["R_hat"], batch["gt_R"], batch["evt_mask"]
 
-        # aggregate each event's contribution over its window (total signed effect)
-        R_hat_tot = R_hat.sum(dim=-1)               # [B, M]
-        gt_R_tot = gt_R.sum(dim=-1)                 # [B, M]
+        R_hat_tot, gt_R_tot = R_hat.sum(-1), gt_R.sum(-1)
         valid = evt_mask > 0
-        R_model.append(R_hat_tot[valid].cpu())
-        R_gt.append(gt_R_tot[valid].cpu())
-
-        # sign accuracy on events whose true effect is non-trivial
+        R_model.append(R_hat_tot[valid].cpu()); R_gt.append(gt_R_tot[valid].cpu())
         nontrivial = valid & (gt_R_tot.abs() > 1e-3)
         sign_correct += int((torch.sign(R_hat_tot[nontrivial]) ==
                              torch.sign(gt_R_tot[nontrivial])).sum())
         sign_total += int(nontrivial.sum())
+        # signed-contribution MAE on non-trivial events
+        R_mae_sum += float((R_hat_tot[nontrivial] - gt_R_tot[nontrivial]).abs().sum())
+        R_mae_n += int(nontrivial.sum())
 
-        # background separation: posterior K_bg vs GT background jump count per interval
-        kbg_model.append(attr["K_bg"].reshape(-1).cpu())
-        kbg_gt.append(batch["gt_K_bg"].reshape(-1).cpu())
+        kbg_model.append(attr["K_bg"].reshape(-1).cpu()); kbg_gt.append(batch["gt_K_bg"].reshape(-1).cpu())
+        kresp_model.append(attr["K_resp"].reshape(-1).cpu()); resp_gt.append(batch["gt_K_resp"].reshape(-1).cpu())
 
-        # response localization: posterior K_resp vs GT response jump count per interval
-        kresp_model.append(attr["K_resp"].reshape(-1).cpu())
-        resp_gt.append(batch["gt_K_resp"].reshape(-1).cpu())
+        # count Poisson-NLL of GT counts under the model's integrated intensities
+        pnll_resp_sum += M.poisson_nll(batch["gt_K_resp"].cpu(), attr["Lam_resp"].cpu()) * batch["gt_K_resp"].numel()
+        pnll_bg_sum += M.poisson_nll(batch["gt_K_bg"].cpu(), attr["Lam_bg"].cpu()) * batch["gt_K_bg"].numel()
+        pnll_n += batch["gt_K_resp"].numel()
 
-    R_model = torch.cat(R_model)
-    R_gt = torch.cat(R_gt)
-    kbg_model = torch.cat(kbg_model)
-    kbg_gt = torch.cat(kbg_gt)
-    kresp_model = torch.cat(kresp_model)
-    resp_gt = torch.cat(resp_gt)
+        # gather for interval-level argmax-match
+        A_all.append(attr["A_hat"].cpu()); gtKevt_all.append(batch["gt_K_evt"].cpu())
+        active_all.append(attr["active"].cpu()); mask_all.append(evt_mask.cpu())
+        tau_all.append(batch["tau"].cpu()); mag_all.append(batch["x_feat"][..., n_types].cpu())
 
-    # shuffle baseline for the attribution correlation
+    R_model, R_gt = torch.cat(R_model), torch.cat(R_gt)
     perm = torch.randperm(R_gt.numel())
-    corr = pearson(R_model, R_gt)
-    corr_shuffle = pearson(R_model, R_gt[perm])
 
-    return {
+    att = M.attribution_report(torch.cat(A_all), torch.cat(gtKevt_all), torch.cat(mask_all),
+                               torch.cat(active_all), torch.cat(tau_all), torch.cat(mag_all))
+
+    out = {
         "nll": nll_sum / n_interval,
-        "mean_mse": mean_se_sum / n_interval,
         "mae_raw": mae_sum / mae_count,
-        "attr_corr": corr,
-        "attr_corr_shuffle": corr_shuffle,
+        "attr_corr": pearson(R_model, R_gt),
+        "attr_corr_shuffle": pearson(R_model, R_gt[perm]),
         "sign_acc": sign_correct / max(sign_total, 1),
-        "bg_corr": pearson(kbg_model, kbg_gt),
-        "resp_loc_corr": pearson(kresp_model, resp_gt),
+        "R_mae": R_mae_sum / max(R_mae_n, 1),
+        "bg_corr": pearson(torch.cat(kbg_model), torch.cat(kbg_gt)),
+        "resp_loc_corr": pearson(torch.cat(kresp_model), torch.cat(resp_gt)),
+        "pnll_resp": pnll_resp_sum / max(pnll_n, 1),
+        "pnll_bg": pnll_bg_sum / max(pnll_n, 1),
     }
+    out.update(att)
+    return out
+
+
+def train_efmjd(args, train_data, W, dt, x_feat_dim, device, epochs, log=False):
+    """Train an EventFieldMJD on ``train_data``; returns (model, loss_curve)."""
+    model = EventFieldMJD(x_feat_dim=x_feat_dim, kappa_trunc=args.kappa_trunc, W=W, dt=dt,
+                          w_mean=args.w_mean, w_rho=args.w_rho, w_ent=args.w_ent).to(device)
+    if log:
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\nTraining...")
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
+    gen = torch.Generator().manual_seed(args.seed)
+    curve = []
+    for epoch in range(epochs):
+        model.train()
+        ep_loss, nb = 0.0, 0
+        for batch in iterate_batches(train_data, args.batch_size, True, device, gen):
+            loss, _ = model.forward(batch)
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            ep_loss += float(loss.detach()); nb += 1
+        sched.step(); curve.append(ep_loss / nb)
+        if log and ((epoch + 1) % 20 == 0 or epoch == 0):
+            tr = evaluate(model, train_data, device, args.batch_size)
+            print(f"Epoch {epoch+1:3d}/{epochs} | loss {curve[-1]:8.4f} | "
+                  f"argmatch top1 {tr['model_top1']:.3f} | sign {tr['sign_acc']:.3f}")
+    return model, curve
+
+
+def run_overlap_sweep(args, gen_data, device, horizons):
+    """Synthetic-II: vary event packing and track interval argmax-match.
+
+    The headline robustness plot: does attribution resolution hold as more
+    events become co-active per interval (and how do baselines fall off)?
+    """
+    spans = [0.80, 0.55, 0.35, 0.20]
+    rows = []
+    for span in spans:
+        data = gen_data(args.seed, span=span)
+        tr, te = train_test_split(data, frac=0.8, seed=args.seed)
+        W, dt = data["meta"]["W"], data["meta"]["dt"]
+        xfd = data["meta"]["x_feat_dim"]
+        model, _ = train_efmjd(args, tr, W, dt, xfd, device, args.sweep_epochs, log=False)
+        m = evaluate(model, te, device, args.batch_size)
+        rows.append((span, m["frac_overlap"], m["model_top1"], m["model_top1_overlap"],
+                     m["random_top1"], m["recent_top1"], m["magnitude_top1"], m["attr_corr"]))
+        print(f"span={span:.2f} overlap_frac={m['frac_overlap']:.2f} | "
+              f"top1={m['model_top1']:.3f} top1_ov={m['model_top1_overlap']:.3f} | "
+              f"rand={m['random_top1']:.3f} recent={m['recent_top1']:.3f} mag={m['magnitude_top1']:.3f} | "
+              f"corr={m['attr_corr']:.3f}")
+    if not args.no_plot:
+        try:
+            import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+            outdir = os.path.join(os.path.dirname(__file__), "outputs"); os.makedirs(outdir, exist_ok=True)
+            ov = [r[1] for r in rows]
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(ov, [r[2] for r in rows], "o-", label="EF-MJD top1")
+            ax.plot(ov, [r[3] for r in rows], "s--", label="EF-MJD top1 (overlap only)")
+            ax.plot(ov, [r[4] for r in rows], ":", label="random")
+            ax.plot(ov, [r[5] for r in rows], ":", label="most-recent")
+            ax.plot(ov, [r[6] for r in rows], ":", label="largest-magnitude")
+            ax.set_xlabel("fraction of scored intervals with >=2 co-active events")
+            ax.set_ylabel("interval argmax-match accuracy")
+            ax.set_title("Attribution resolution vs overlap (Synthetic-II)")
+            ax.legend(fontsize=8); fig.tight_layout()
+            fig.savefig(os.path.join(outdir, "04_overlap_sweep.png"), dpi=120); plt.close(fig)
+            print(f"\nSweep figure written to {outdir}/04_overlap_sweep.png")
+        except Exception as e:
+            print(f"(sweep plot skipped: {e})")
 
 
 def main():
@@ -144,68 +238,97 @@ def main():
     ap.add_argument("--w_mean", type=float, default=1.0)
     ap.add_argument("--w_rho", type=float, default=1e-3)
     ap.add_argument("--w_ent", type=float, default=1e-3)
+    # --- DGP knobs (overlap + Synthetic-III misspecification) ---
+    ap.add_argument("--event_span_frac", type=float, default=0.80)  # smaller = more overlap
+    ap.add_argument("--max_delay", type=float, default=2.0)
+    ap.add_argument("--personal_scale_sigma", type=float, default=0.2)
+    ap.add_argument("--mag_skew", type=float, default=0.0)
+    ap.add_argument("--label_noise_p", type=float, default=0.0)
+    ap.add_argument("--label_missing_p", type=float, default=0.0)
+    ap.add_argument("--smooth_response", action="store_true")
+    ap.add_argument("--misspec", action="store_true",
+                    help="preset: skewed magnitude + label noise + missing labels")
+    # --- evaluation extras ---
+    ap.add_argument("--horizons", type=str, default="1,4,8,12")
+    ap.add_argument("--no_baseline", action="store_true")
+    ap.add_argument("--no_multi_horizon", action="store_true")
+    ap.add_argument("--overlap_sweep", action="store_true",
+                    help="train+eval across event_span_frac levels and plot argmax-match")
+    ap.add_argument("--sweep_epochs", type=int, default=120)
     ap.add_argument("--no_plot", action="store_true")
     args = ap.parse_args()
+
+    if args.misspec:
+        args.mag_skew = max(args.mag_skew, 1.0)
+        args.label_noise_p = max(args.label_noise_p, 0.15)
+        args.label_missing_p = max(args.label_missing_p, 0.15)
+
+    horizons = [int(h) for h in args.horizons.split(",") if h]
+
+    def gen_data(seed, span=None):
+        return generate_dataset(
+            num_samples=args.num_samples, seed=seed,
+            event_span_frac=span if span is not None else args.event_span_frac,
+            max_delay=args.max_delay, personal_scale_sigma=args.personal_scale_sigma,
+            mag_skew=args.mag_skew, label_noise_p=args.label_noise_p,
+            label_missing_p=args.label_missing_p, smooth_response=args.smooth_response)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    # ----- overlap sweep mode (Synthetic-II): train+eval across packing levels
+    if args.overlap_sweep:
+        run_overlap_sweep(args, gen_data, device, horizons)
+        return
+
     # ----- data
-    data = generate_dataset(num_samples=args.num_samples, seed=args.seed)
+    data = gen_data(args.seed)
     train_data, test_data = train_test_split(data, frac=0.8, seed=args.seed)
-    W = data["meta"]["W"]
-    dt = data["meta"]["dt"]
-    print(f"Train sequences: {train_data['X'].shape[0]}, Test: {test_data['X'].shape[0]}, "
-          f"T={data['meta']['T']}, W={W}")
-
-    # ----- model
+    W, dt = data["meta"]["W"], data["meta"]["dt"]
     x_feat_dim = data["meta"]["x_feat_dim"]
-    model = EventFieldMJD(x_feat_dim=x_feat_dim, kappa_trunc=args.kappa_trunc, W=W, dt=dt,
-                          w_mean=args.w_mean, w_rho=args.w_rho, w_ent=args.w_ent).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params:,}")
+    print(f"Train sequences: {train_data['X'].shape[0]}, Test: {test_data['X'].shape[0]}, "
+          f"T={data['meta']['T']}, W={W}  | misspec(skew={args.mag_skew},"
+          f" noise={args.label_noise_p}, miss={args.label_missing_p}, smooth={args.smooth_response})")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-5)
-    gen = torch.Generator().manual_seed(args.seed)
-
-    nll_curve = []
-    print("\nTraining...")
-    for epoch in range(args.epochs):
-        model.train()
-        ep_loss, nb = 0.0, 0
-        for batch in iterate_batches(train_data, args.batch_size, True, device, gen):
-            loss, _ = model.forward(batch)
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step()
-            ep_loss += float(loss.detach())
-            nb += 1
-        sched.step()
-        avg = ep_loss / nb
-        nll_curve.append(avg)
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            tr = evaluate(model, train_data, device, args.batch_size)
-            print(f"Epoch {epoch+1:3d}/{args.epochs} | loss {avg:8.4f} | "
-                  f"train NLL {tr['nll']:7.4f} | attr_corr {tr['attr_corr']:.3f} | "
-                  f"sign_acc {tr['sign_acc']:.3f}")
+    model, nll_curve = train_efmjd(args, train_data, W, dt, x_feat_dim, device, args.epochs, log=True)
 
     # ----- final evaluation
     print("\n=== Final evaluation ===")
     for name, ds in [("train", train_data), ("test", test_data)]:
         m = evaluate(model, ds, device, args.batch_size)
         print(f"\n[{name}]")
-        print(f"  NLL (per interval)        : {m['nll']:.4f}")
-        print(f"  mean-loss MSE (log space) : {m['mean_mse']:.5f}")
-        print(f"  one-step MAE (raw S)      : {m['mae_raw']:.4f}")
-        print(f"  attribution corr (R vs GT): {m['attr_corr']:.3f}   "
-              f"(shuffle baseline {m['attr_corr_shuffle']:.3f})")
-        print(f"  event sign accuracy       : {m['sign_acc']:.3f}")
-        print(f"  response loc. corr (Kresp): {m['resp_loc_corr']:.3f}")
-        print(f"  background corr (Kbg vs GT): {m['bg_corr']:.3f}")
+        print(f"  NLL (per interval)         : {m['nll']:.4f}")
+        print(f"  one-step MAE (raw S)       : {m['mae_raw']:.4f}")
+        print(f"  -- attribution (headline: interval argmax-match) --")
+        print(f"  argmax-match top1          : {m['model_top1']:.3f}  "
+              f"(random {m['random_top1']:.3f}, recent {m['recent_top1']:.3f}, mag {m['magnitude_top1']:.3f})")
+        print(f"  argmax-match top2          : {m['model_top2']:.3f}")
+        print(f"  argmax-match top1 (overlap): {m['model_top1_overlap']:.3f}  "
+              f"[{m['frac_overlap']*100:.0f}% of {m['n_scored']} scored intervals]")
+        print(f"  per-event count corr / MAE : {m['count_corr']:.3f} / {m['count_mae']:.3f}")
+        print(f"  signed-R: corr {m['attr_corr']:.3f} (shuffle {m['attr_corr_shuffle']:.3f}),"
+              f" sign-acc {m['sign_acc']:.3f}, MAE {m['R_mae']:.4f}")
+        print(f"  count Poisson-NLL resp/bg  : {m['pnll_resp']:.3f} / {m['pnll_bg']:.3f}")
+        print(f"  resp/bg count corr         : {m['resp_loc_corr']:.3f} / {m['bg_corr']:.3f}")
+
+    # ----- GRU forecasting baseline + multi-horizon comparison
+    if not args.no_multi_horizon or not args.no_baseline:
+        print("\n=== Forecasting (multi-horizon MAE, raw S) ===")
+        mh_model = multi_horizon_mae(model, test_data, device, args.batch_size, horizons)
+        gru = None
+        if not args.no_baseline:
+            from baselines import GRUForecaster, train_gru
+            gru = GRUForecaster(x_feat_dim=x_feat_dim, dt=dt).to(device)
+            train_gru(gru, train_data, device, epochs=max(60, args.epochs // 4),
+                      lr=args.lr, batch_size=args.batch_size, seed=args.seed)
+            mh_gru = multi_horizon_mae(gru, test_data, device, args.batch_size, horizons)
+        hdr = "  horizon:      " + "  ".join(f"{h:>7d}" for h in mh_model)
+        print(hdr)
+        print("  EF-MJD :      " + "  ".join(f"{mh_model[h]:7.3f}" for h in mh_model))
+        if gru is not None:
+            print("  GRU    :      " + "  ".join(f"{mh_gru[h]:7.3f}" for h in mh_gru))
 
     # ----- plots
     if not args.no_plot:

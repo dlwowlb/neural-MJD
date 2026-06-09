@@ -50,10 +50,24 @@ the signed `R_{i,j}^GT = Σ log Y`; per event we also store the true onset delay
 
 ```bash
 cd event_field_mjd
-python validate.py                 # full run (~250 epochs, CPU-friendly)
+python validate.py                 # full run (~250 epochs) + GRU baseline + multi-horizon
 python validate.py --epochs 30 --num_samples 256 --no_plot   # quick check
-# regulariser weights are tunable: --w_mean --w_rho --w_ent
+python validate.py --overlap_sweep                           # Synthetic-II: argmax-match vs overlap
+python validate.py --misspec                                 # Synthetic-III: skew + label noise/missing
+# knobs: --w_mean --w_rho --w_ent  (loss)  | --event_span_frac (overlap; smaller=more)
+#        --max_delay --personal_scale_sigma | --mag_skew --label_noise_p --label_missing_p --smooth_response
+#        --horizons 1,4,8,12 | --no_baseline --no_multi_horizon
 ```
+
+### Metrics reported
+- **Forecast:** one-step MAE (raw `S`) and **multi-horizon** MAE (1/4/8/12-step, autoregressive) vs a **GRU** baseline.
+- **Attribution headline — interval argmax-match:** for each interval that truly
+  had a response, does the model give the largest expected count to the *same*
+  event the GT did? Reported as top-1, top-2, and an **overlap-only** slice
+  (≥2 co-active events), against **random / most-recent / largest-magnitude** baselines.
+- **Counts:** per-event count corr & MAE (`A_{i,j}` vs `K^GT_{i,j}`), response/background
+  count corr, and count **Poisson-NLL**.
+- **Signed response (secondary):** Pearson corr, sign-accuracy, MAE of `R_{i,j}` vs GT.
 
 ## Training objective
 
@@ -74,33 +88,39 @@ L = L_NLL  +  w_mean · L_route  +  w_rho · L_rho  +  w_ent · L_ent
 - `L_ent = Σ π̄ log π̄` — entropy term (minimised → higher entropy) that
   discourages degenerate attribution collapse.
 
-## Representative result (250 epochs, CPU, held-out test set)
+## Results (250 epochs, CPU, held-out test; seeds 0–3)
 
-| metric | value | reading |
-|--------|-------|---------|
-| NLL / interval | **−2.50** | likelihood converges |
-| one-step MAE (raw `S`) | **3.0** | small on an `S` spanning ~35–240 |
-| attribution corr `R` vs GT | **0.81** (shuffle 0.03) | per-event signed response recovered |
-| event sign accuracy | **0.99** | up/down direction recovered |
-| response localization (`K_resp` vs GT count) | **0.85** | recovers *how many* response jumps per interval |
-| background separation (`K_bg` vs GT count) | **0.61** | recovers background jump counts |
+| metric | result | reading |
+|--------|--------|---------|
+| NLL / interval | **≈ −2.5** | likelihood converges |
+| one-step MAE (raw `S`) | **≈ 2.7** | forecast is good |
+| count Poisson-NLL (resp/bg) | converges | intensities calibrated; bg-count corr ≈ 0.4 |
+| **interval argmax-match (top-1)** | **≈ random** | ⚠ attribution **not** resolved |
+| signed-`R` sign-accuracy | **≈ 0.2–0.3** | ⚠ systematically *anti*-correlated |
 
-(With per-event onset delay and a hidden per-subject gain enabled by default;
-turn them off via `max_delay=0`, `personal_scale_sigma=0` for the easiest setting.)
-
-The attribution scatter (`outputs/03_attribution_scatter.png`) now lies close to
-`y=x`: under the model-matched DGP both the **sign and magnitude** of each
-event's signed log-response are recovered (the cluster at `x≈0` is events that
-happened to fire no response jumps, i.e. no signal to attribute).
-Exact numbers vary with `--seed`.
-
-> **Convergence note.** Because drift/diffusion is *trajectory-only* (events
-> enter only through `Z`), the response channel has to carry every event effect,
-> which makes attribution converge slowly — it passes through an anti-correlated
-> phase before locking on. ~200–250 epochs are needed for the attribution
-> metrics to settle (forecast/NLL converge much earlier). Letting drift also see
-> `Z` speeds this up to ~120 epochs but violates the endogenous/exogenous split,
-> so we keep the faithful version.
+> ### ⚠ Finding: attribution is not yet reliably identified
+> The stronger metrics added here (interval argmax-match + multi-seed) reveal
+> that, under the spec-faithful objective, **the model forecasts well but does
+> not reliably recover per-event attribution**: across seeds 0–3 the argmax-match
+> is at chance and the signed-`R` sign-accuracy sits at ~0.2 (anti-correlated).
+> Earlier single-run numbers (corr 0.81 / sign 0.99) were a **lucky optimisation
+> basin, not reproducible** — exactly the failure mode the headline change to
+> argmax-match was meant to catch (a magnitude-weighted global correlation can
+> look good while interval-level attribution is wrong).
+>
+> **Root cause.** The NLL drift `μ = p_θ(h_t^Y)` is conditioned on the causal
+> trajectory encoding `h`, which already reflects the ongoing event response, so
+> `μ` can predict the response-driven increment with **zero response jumps**. The
+> likelihood is then indifferent to `λ_resp`, `π`, `ρ`, leaving attribution to a
+> weak self-supervised signal (`L_route`) whose optimisation is **bimodal**
+> (correct- vs flipped-sign basins). Restricting the *endogenous* head `b_θ`
+> alone does **not** fix it (tested), because the absorption happens in `μ`.
+>
+> **Proposed fix (not yet applied — deviates from the spec's eq. 26/52).** Make
+> the NLL response magnitude *attribution-derived*, `ν̄_j = Σ_i π̄_{i,j} ρ_{i,j}`,
+> so the likelihood itself depends on `π,ρ` and identifies them (and their sign)
+> directly. This couples attribution into the collapsed mixture rather than
+> leaving it to `L_route`. Awaiting decision since it changes the likelihood.
 
 > **Validation scope.** This is the **Level-1, model-matched** check: the DGP
 > obeys the model's own assumptions, so strong recovery is the *expected* sanity

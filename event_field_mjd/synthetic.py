@@ -74,6 +74,13 @@ def generate_dataset(
     mag_scale=1.0,         # global multiplier on response magnitude mean
     max_delay=2.0,         # per-event response onset delay ~ U(0, max_delay)
     personal_scale_sigma=0.2,  # per-subject latent effect scaling (unseen by model)
+    event_span_frac=0.80,  # OVERLAP KNOB: events packed into [0.05, 0.05+span]*horizon;
+                           # smaller -> events bunch up -> more co-active events / interval
+    # --- Synthetic-III misspecification toggles (all default off) ---
+    mag_skew=0.0,          # >0: response log-magnitude is right-skewed, not Gaussian
+    label_noise_p=0.0,     # prob the model-visible event TYPE is randomised (true effect intact)
+    label_missing_p=0.0,   # prob an event is hidden from the model (effect still in trajectory)
+    smooth_response=False, # response added as a continuous drift instead of discrete jumps
     baseline_log_range=(math.log(80.0), math.log(120.0)),
     seed=0,
 ):
@@ -109,20 +116,28 @@ def generate_dataset(
         personal = float(rng.lognormal(0.0, personal_scale_sigma))
         n_evt = int(rng.integers(n_events_range[0], n_events_range[1] + 1))
 
-        # ---- Step 1: events (time, type, magnitude), off the sensor grid
-        taus = np.sort(rng.uniform(0.05 * horizon, 0.85 * horizon, size=n_evt))
-        taus = taus + 0.5 * dt * rng.uniform(-0.4, 0.4, size=n_evt)
+        # ---- Step 1: events (time, type, magnitude), off the sensor grid.
+        # event_span_frac controls temporal packing (overlap knob).
+        span = max(event_span_frac, 1e-3) * horizon
+        taus = np.sort(rng.uniform(0.05 * horizon, 0.05 * horizon + span, size=n_evt))
+        taus = np.clip(taus + 0.5 * dt * rng.uniform(-0.4, 0.4, size=n_evt), 0.0, horizon - 1e-3)
         type_idx = rng.integers(0, n_types, size=n_evt)
         mags = rng.uniform(0.5, 1.5, size=n_evt)
         delays = rng.uniform(0.0, max_delay, size=n_evt)       # per-event onset delay
 
         tau[b, :n_evt] = taus
-        for i in range(n_evt):
-            x_feat[b, i, type_idx[i]] = 1.0           # one-hot type
-            x_feat[b, i, n_types] = mags[i]           # magnitude (observed)
-        evt_mask[b, :n_evt] = 1.0
         gt_delay[b, :n_evt] = delays
         gt_event_type[b, :n_evt] = type_idx
+        # --- model-visible features, with optional label noise / missingness ---
+        for i in range(n_evt):
+            if rng.random() < label_missing_p:
+                continue                              # event hidden: x_feat=0, evt_mask=0
+            vis_type = type_idx[i]
+            if rng.random() < label_noise_p:
+                vis_type = int(rng.integers(0, n_types))   # corrupt the observed type only
+            x_feat[b, i, vis_type] = 1.0              # one-hot type (possibly corrupted)
+            x_feat[b, i, n_types] = mags[i]           # magnitude (observed)
+            evt_mask[b, i] = 1.0
 
         # ---- Step 2: per-event response kernels g_i on the fine grid.
         # Response starts only after an onset delay and is hard-windowed to
@@ -169,14 +184,31 @@ def generate_dataset(
                 gt_K_bg[b, j] += 1
                 gt_bg_R[b, j] += logY
 
-            # response jumps  r=i, only if some event active here
+            # response: discrete marked jumps (default) or a continuous drift
+            # (smooth_response misspecification -- model assumes jumps).
             lam_r = lam_resp[n]
-            if active_any[n] and lam_r > 0:
+            if smooth_response:
+                # add E[response] as a deterministic increment; record continuous
+                # contributions / expected counts (real-valued) per event.
+                if active_any[n]:
+                    for i in range(n_evt):
+                        if g[i, n] <= 0:
+                            continue
+                        contrib = g[i, n] * nu_i[i] * dt_fine
+                        x += contrib
+                        gt_R[b, i, j] += contrib
+                        gt_K_evt[b, i, j] += g[i, n] * dt_fine
+                        gt_K_resp[b, j] += g[i, n] * dt_fine
+            elif active_any[n] and lam_r > 0:
                 k_resp = rng.poisson(lam_r * dt_fine)
                 p_src = pi_gt[:, n] / pi_gt[:, n].sum()         # guard fp drift
                 for _ in range(k_resp):
                     src = rng.choice(n_evt, p=p_src)            # source ~ pi^GT(t)
-                    logY = rng.normal(nu_i[src], gamma_resp)
+                    if mag_skew > 0:
+                        e = rng.exponential(1.0) - 1.0          # mean 0, right-skewed
+                        logY = nu_i[src] + gamma_resp * e
+                    else:
+                        logY = rng.normal(nu_i[src], gamma_resp)
                     x += logY
                     gt_K_resp[b, j] += 1
                     gt_K_evt[b, src, j] += 1

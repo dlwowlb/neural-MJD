@@ -131,8 +131,7 @@ class EventFieldMJD(nn.Module):
 
         # --- Endogenous one-step increment head for the routed mean objective:
         # DeltaX^Y = b_theta^Y(X_{t_j}, h_t^Y, Delta_j). Dedicated (separate from
-        # the NLL's SDE drift) so the routed reconstruction has its own smooth
-        # term and the response term carries only event effects.
+        # the NLL's SDE drift) so the routed reconstruction has its own smooth term.
         self.b_theta = mlp([d_h + 2, d_h, 1])
 
         # Precompute truncated count grid (eq. 57): {(k_bg,k_resp): sum<=kappa}
@@ -356,7 +355,7 @@ class EventFieldMJD(nn.Module):
         # marginalises event identity and cannot train them).
         x_cur = X[:, :-1]                                          # [B, T]
         h_j = h_grid[:, :-1]                                       # [B, T, d_h]
-        x_rel = (x_cur - X[:, :1])                                 # offset like the encoder input
+        x_rel = (x_cur - X[:, :1])                                 # current level offset
         dt_feat = torch.full_like(x_cur, self.dt)
         endo_in = torch.cat([h_j, x_rel.unsqueeze(-1), dt_feat.unsqueeze(-1)], dim=-1)
         dXY = self.b_theta(endo_in).squeeze(-1)                    # DeltaX^Y  [B, T]
@@ -430,4 +429,38 @@ class EventFieldMJD(nn.Module):
         P_resp = 1.0 - no_hit
 
         return {"R_hat": R_hat, "A_hat": A_hat, "P_resp": P_resp,
-                "K_resp": K_resp, "K_bg": K_bg, "pi_bar": pi_bar}
+                "K_resp": K_resp, "K_bg": K_bg, "pi_bar": pi_bar,
+                "active": cache["active"].transpose(1, 2),   # [B, M, T] active mask
+                "Lam_resp": cache["extra"]["Lam_rp"],        # [B, T] integrated response intensity
+                "Lam_bg": cache["extra"]["Lam_bg"]}          # [B, T] integrated background intensity
+
+    # ------------------------------------------------------------------ #
+    #  Multi-horizon autoregressive forecast
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def rollout_forecast(self, batch, start_j, horizon):
+        """Autoregressive multi-step forecast of X from interval ``start_j``.
+
+        Events are exogenous (known for all t); only the trajectory is rolled
+        forward. At each step the encoder/field/heads are recomputed on the
+        trajectory built from observed values up to ``start_j`` plus the model's
+        own predictions afterwards. Returns predicted log-states
+        ``X_hat[:, start_j+1 : start_j+1+horizon]``.
+        """
+        X = batch["X"]
+        B, Tp1 = X.shape
+        horizon = min(horizon, Tp1 - 1 - start_j)
+        x_pred = X.clone()
+        preds = []
+        for k in range(horizon):
+            j = start_j + k
+            sub = dict(batch)
+            sub["X"] = x_pred
+            _, cache = self.forward(sub)
+            # one-step mean increment predicted for interval j
+            inc = cache["mean_pred"][:, j] - x_pred[:, j]
+            x_next = x_pred[:, j] + inc
+            x_pred = x_pred.clone()
+            x_pred[:, j + 1] = x_next
+            preds.append(x_next)
+        return torch.stack(preds, dim=1)                     # [B, horizon]
