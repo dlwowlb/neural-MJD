@@ -116,11 +116,16 @@ L = L_NLL  +  w_mean · L_route  +  w_rho · L_rho  +  w_ent · L_ent
 > (correct- vs flipped-sign basins). Restricting the *endogenous* head `b_θ`
 > alone does **not** fix it (tested), because the absorption happens in `μ`.
 >
-> **Proposed fix (not yet applied — deviates from the spec's eq. 26/52).** Make
-> the NLL response magnitude *attribution-derived*, `ν̄_j = Σ_i π̄_{i,j} ρ_{i,j}`,
-> so the likelihood itself depends on `π,ρ` and identifies them (and their sign)
-> directly. This couples attribution into the collapsed mixture rather than
-> leaving it to `L_route`. Awaiting decision since it changes the likelihood.
+> **Partial fix — `--couple_attr` (off by default; deviates from spec eq. 26/52).**
+> Makes the NLL response magnitude attribution-derived, `ν̄_j = Σ_i π̄_{i,j} ρ_{i,j}`,
+> so the likelihood depends on `π,ρ` directly. Multi-seed (150 ep): it **helps but
+> does not fully solve** the problem — one seed recovered counts strongly
+> (count-corr ≈ 0.69, resp-loc ≈ 0.85) while others stayed stuck (sign ≈ 0.23).
+> Reason: the coupling only matters when response jumps actually carry likelihood
+> weight, but the drift `μ=p_θ(h)` still absorbs the response so `λ_resp→0` on the
+> stuck seeds. A complete fix additionally needs to stop `μ` from seeing
+> event-correlated history (or to penalise `λ_resp→0`) so the response channel is
+> forced to fire. That is a larger model change and is left as the next step.
 
 > **Validation scope.** This is the **Level-1, model-matched** check: the DGP
 > obeys the model's own assumptions, so strong recovery is the *expected* sanity

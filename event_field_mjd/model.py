@@ -80,8 +80,13 @@ class EventFieldMJD(nn.Module):
         w_mean=1.0,        # omega_route in eq. 69
         w_rho=1e-3,        # weight of the rho magnitude L2 regulariser (L_rho)
         w_ent=1e-3,        # weight of the attribution entropy regulariser (L_ent)
+        couple_attr=False, # if True, the NLL response magnitude is the attribution-
+                           # weighted event magnitude nu_bar = sum_i pi_bar_i * rho_i
+                           # (couples pi/rho into the likelihood -> identifiable);
+                           # default False keeps the spec-faithful shared m_resp.
     ):
         super().__init__()
+        self.couple_attr = couple_attr
         self.d_h, self.d_z, self.d_evt = d_h, d_z, d_evt
         self.kappa_trunc = kappa_trunc
         self.W = W
@@ -280,7 +285,7 @@ class EventFieldMJD(nn.Module):
     # ------------------------------------------------------------------ #
     #  Likelihood (collapsed, truncated) + auxiliary mean
     # ------------------------------------------------------------------ #
-    def _collapsed_terms(self, X, params, has_active):
+    def _collapsed_terms(self, X, params, has_active, nu_rp_override=None):
         """Build per-(interval, count-pair) Gaussian params and Poisson weights.
 
         Returns:
@@ -288,6 +293,10 @@ class EventFieldMJD(nn.Module):
           a       [B, T, P]  conditional mean (eq. 54)
           b2      [B, T, P]  conditional variance (eq. 55)
           x_next  [B, T]     target X_{t_{j+1}}
+
+        If ``nu_rp_override`` ([B,T]) is given (couple_attr mode), it replaces the
+        shared response magnitude mean in the Gaussian mean and compensator, so
+        the likelihood depends on the attribution shares / event magnitudes.
         """
         B = X.shape[0]
         T = params["mu"].shape[1]
@@ -297,6 +306,8 @@ class EventFieldMJD(nn.Module):
         mu, sigma = params["mu"], params["sigma"]
         nu_bg, gam_bg = params["nu_bg"], params["gam_bg"]
         nu_rp, gam_rp = params["nu_rp"], params["gam_rp"]
+        if nu_rp_override is not None:
+            nu_rp = nu_rp_override                        # attribution-weighted mean
         lam_bg, lam_rp = params["lam_bg"], params["lam_rp"]
 
         # response intensity only counts when active events exist (eq. 43)
@@ -341,7 +352,10 @@ class EventFieldMJD(nn.Module):
         pi_bar, active, has_active, rho = self.attribution_shares(
             h_grid, Z_grid, tau, x_feat, evt_mask, grid)
 
-        log_w, a, b2, x_next, extra = self._collapsed_terms(X, params, has_active)
+        # couple_attr: feed the attribution-weighted event magnitude into the NLL
+        nu_rp_override = (pi_bar * rho).sum(dim=-1) if self.couple_attr else None  # [B,T]
+        log_w, a, b2, x_next, extra = self._collapsed_terms(
+            X, params, has_active, nu_rp_override=nu_rp_override)
 
         # truncated collapsed log-likelihood (eq. 58)
         log_p = torch.logsumexp(log_w, dim=-1)            # [B, T]
