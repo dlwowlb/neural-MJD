@@ -46,7 +46,8 @@ def iterate_batches(data, batch_size, shuffle, device, generator=None):
             "x_feat": data["x_feat"][sel],
             "evt_mask": data["evt_mask"][sel],
             "gt_R": data["gt_R"][sel],
-            "gt_bg": data["gt_bg"][sel],
+            "gt_K_resp": data["gt_K_resp"][sel],
+            "gt_K_bg": data["gt_K_bg"][sel],
             "grid": data["grid"],
         }
         yield move(batch, device)
@@ -100,13 +101,13 @@ def evaluate(model, data, device, batch_size):
                              torch.sign(gt_R_tot[nontrivial])).sum())
         sign_total += int(nontrivial.sum())
 
-        # background separation: posterior K_bg vs |gt background| per interval
+        # background separation: posterior K_bg vs GT background jump count per interval
         kbg_model.append(attr["K_bg"].reshape(-1).cpu())
-        kbg_gt.append(batch["gt_bg"].abs().reshape(-1).cpu())
+        kbg_gt.append(batch["gt_K_bg"].reshape(-1).cpu())
 
-        # response localization: posterior K_resp vs |gt total response| per interval
+        # response localization: posterior K_resp vs GT response jump count per interval
         kresp_model.append(attr["K_resp"].reshape(-1).cpu())
-        resp_gt.append(gt_R.sum(dim=1).abs().reshape(-1).cpu())
+        resp_gt.append(batch["gt_K_resp"].reshape(-1).cpu())
 
     R_model = torch.cat(R_model)
     R_gt = torch.cat(R_gt)
@@ -135,11 +136,14 @@ def evaluate(model, data, device, batch_size):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--num_samples", type=int, default=768)
-    ap.add_argument("--epochs", type=int, default=120)
+    ap.add_argument("--epochs", type=int, default=250)
     ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--kappa_trunc", type=int, default=4)
+    ap.add_argument("--kappa_trunc", type=int, default=5)
+    ap.add_argument("--w_mean", type=float, default=1.0)
+    ap.add_argument("--w_rho", type=float, default=1e-3)
+    ap.add_argument("--w_ent", type=float, default=1e-3)
     ap.add_argument("--no_plot", action="store_true")
     args = ap.parse_args()
 
@@ -157,7 +161,9 @@ def main():
           f"T={data['meta']['T']}, W={W}")
 
     # ----- model
-    model = EventFieldMJD(x_feat_dim=1, kappa_trunc=args.kappa_trunc, W=W, dt=dt).to(device)
+    x_feat_dim = data["meta"]["x_feat_dim"]
+    model = EventFieldMJD(x_feat_dim=x_feat_dim, kappa_trunc=args.kappa_trunc, W=W, dt=dt,
+                          w_mean=args.w_mean, w_rho=args.w_rho, w_ent=args.w_ent).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
@@ -238,14 +244,14 @@ def make_plots(model, train_data, test_data, nll_curve, device, batch_size):
     X = batch["X"][b].cpu().numpy()
     mean_pred = cache["mean_pred"][b].cpu().numpy()       # predicts X[1:]
     taus = batch["tau"][b].cpu().numpy()
-    feats = batch["x_feat"][b, :, 0].cpu().numpy()
+    gt_sign = batch["gt_R"][b].sum(-1).cpu().numpy()     # signed true effect per event
     emask = batch["evt_mask"][b].cpu().numpy() > 0
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(grid, np.exp(X), "k.-", label="true S", ms=3)
     ax.plot(grid[1:], np.exp(mean_pred), "C0--", label="pred mean S")
     for i in np.where(emask)[0]:
-        c = "C2" if feats[i] >= 0 else "C3"
+        c = "C2" if gt_sign[i] >= 0 else "C3"
         ax.axvline(taus[i], color=c, alpha=0.4, lw=1.5)
     ax.set_xlabel("time"); ax.set_ylabel("S (raw)")
     ax.set_title("Trajectory, events (green=up, red=down), one-step mean")

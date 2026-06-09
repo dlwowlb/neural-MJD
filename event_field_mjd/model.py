@@ -77,7 +77,9 @@ class EventFieldMJD(nn.Module):
         bound_nu=0.6,
         bound_gamma=0.5,
         bound_lambda=4.0,
-        w_mean=1.0,        # omega in eq. 69
+        w_mean=1.0,        # omega_route in eq. 69
+        w_rho=1e-3,        # weight of the rho magnitude L2 regulariser (L_rho)
+        w_ent=1e-3,        # weight of the attribution entropy regulariser (L_ent)
     ):
         super().__init__()
         self.d_h, self.d_z, self.d_evt = d_h, d_z, d_evt
@@ -90,6 +92,8 @@ class EventFieldMJD(nn.Module):
         self.bound_gamma = bound_gamma
         self.bound_lambda = bound_lambda
         self.w_mean = w_mean
+        self.w_rho = w_rho
+        self.w_ent = w_ent
 
         # --- Encoder for history h_t (eq. 7), causal GRU over [x_value, event_agg]
         self.enc_in = 1 + x_feat_dim          # current log-state + aggregated event feature
@@ -112,14 +116,24 @@ class EventFieldMJD(nn.Module):
         # softmax pi (eqs. 15/47) and trace psi (eq. 14) receive a gradient:
         # the *collapsed* NLL (eqs. 53-58) marginalises event identity and gives
         # pi no signal on its own. See README "identifiability" note.
-        self.rho_head = mlp([d_evt, d_evt, 1])
+        self.rho_head = mlp([d_evt + d_z + d_h, d_evt, 1])
 
         # --- Jump magnitude heads (eqs. 23-26): each outputs (nu, gamma_raw)
         self.m_bg = mlp([d_h, d_h, 2])
         self.m_resp = mlp([d_z + d_h, d_h, 2])
 
-        # --- Drift / diffusion (eq. 28): outputs (mu, sigma_raw)
-        self.p_theta = mlp([d_h + d_z, d_h, 2])
+        # --- Drift / diffusion (eq. 28): mu, sigma = p_theta^Y(h_t^Y).
+        # Trajectory-only history: the smooth drift/diffusion must NOT see events
+        # (directly or via Z), otherwise it absorbs event-driven increments and
+        # the response/attribution channel gets no work (endogenous vs exogenous
+        # separation).
+        self.p_theta = mlp([d_h, d_h, 2])
+
+        # --- Endogenous one-step increment head for the routed mean objective:
+        # DeltaX^Y = b_theta^Y(X_{t_j}, h_t^Y, Delta_j). Dedicated (separate from
+        # the NLL's SDE drift) so the routed reconstruction has its own smooth
+        # term and the response term carries only event effects.
+        self.b_theta = mlp([d_h + 2, d_h, 1])
 
         # Precompute truncated count grid (eq. 57): {(k_bg,k_resp): sum<=kappa}
         pairs = [(a, b) for a in range(kappa_trunc + 1)
@@ -186,11 +200,12 @@ class EventFieldMJD(nn.Module):
         """Compute the piecewise-constant interval parameters for j=0..T-1.
 
         Returns a dict of [B, T] tensors (and intensities)."""
-        h = h_grid[:, :-1]      # context at interval start (predictable)
+        h = h_grid[:, :-1]      # trajectory-only context at interval start (predictable)
         Z = Z_grid[:, :-1]
         hz = torch.cat([h, Z], dim=-1)
 
-        mu_raw, sig_raw = self.p_theta(hz).chunk(2, dim=-1)                 # eq. 28
+        # drift/diffusion: trajectory-only (h^Y), events excluded by design (eq. 28)
+        mu_raw, sig_raw = self.p_theta(h).chunk(2, dim=-1)
         mu = self.bound_mu * torch.tanh(mu_raw.squeeze(-1))
         sigma = self.bound_sigma * torch.sigmoid(sig_raw.squeeze(-1)) + 1e-3
 
@@ -257,8 +272,10 @@ class EventFieldMJD(nn.Module):
         # if no active events, softmax over all -inf is uniform; force to 0
         pi_bar = torch.where(has_active.unsqueeze(-1), pi_bar, torch.zeros_like(pi_bar))
 
-        # event-specific signed response magnitude rho_{i,j} from the trace
-        rho = self.bound_nu * torch.tanh(self.rho_head(zeta).squeeze(-1))    # [B,T,M]
+        # event-specific signed response magnitude rho_{i,j} = rho_max * tanh(
+        #   r_theta(zeta_i, Z_t, h_t) ) -- conditions on the current field/history
+        rho = self.bound_nu * torch.tanh(
+            self.rho_head(torch.cat([zeta, Z_t, h_t], dim=-1)).squeeze(-1))   # [B,T,M]
         return pi_bar, active, has_active.float(), rho
 
     # ------------------------------------------------------------------ #
@@ -331,27 +348,44 @@ class EventFieldMJD(nn.Module):
         log_p = torch.logsumexp(log_w, dim=-1)            # [B, T]
         nll = -log_p
 
-        # auxiliary mean prediction (eqs. 69-70): expected one-step log-increment.
-        # The response term is the sum of *attributed* expected responses, each
-        # carrying the event-specific magnitude rho_{i,j}:
-        #   resp_incr_j = sum_i [Lambda_resp,j * pi_bar_{i,j}] * rho_{i,j}   (eqs. 46/66)
-        # Routing the response through pi_bar and rho gives the attribution
-        # softmax and event trace a real gradient (the collapsed NLL alone does
-        # not -- it marginalises event identity).
-        x_cur = X[:, :-1]
+        # routed mean reconstruction (eqs. 69-70):
+        #   X_hat_{t_{j+1}} = X_{t_j} + DeltaX^Y_j + sum_i Lambda_attr_{i,j} * rho_{i,j}
+        # endogenous term DeltaX^Y from a dedicated trajectory-only head (no
+        # background, no event info); response term routed through pi_bar and rho
+        # so the attribution softmax / trace get a gradient (the collapsed NLL
+        # marginalises event identity and cannot train them).
+        x_cur = X[:, :-1]                                          # [B, T]
+        h_j = h_grid[:, :-1]                                       # [B, T, d_h]
+        x_rel = (x_cur - X[:, :1])                                 # offset like the encoder input
+        dt_feat = torch.full_like(x_cur, self.dt)
+        endo_in = torch.cat([h_j, x_rel.unsqueeze(-1), dt_feat.unsqueeze(-1)], dim=-1)
+        dXY = self.b_theta(endo_in).squeeze(-1)                    # DeltaX^Y  [B, T]
+
         Lam_attr = extra["Lam_rp"].unsqueeze(-1) * pi_bar          # [B, T, M] (eq. 46)
         resp_incr = (Lam_attr * rho).sum(dim=-1)                   # [B, T]
-        bg_incr = extra["Lam_bg"] * params["nu_bg"]
-        mean_pred = x_cur + extra["drift"] + bg_incr + resp_incr
+        mean_pred = x_cur + dXY + resp_incr
         mean_loss = (x_next - mean_pred) ** 2
 
-        loss = nll.mean() + self.w_mean * mean_loss.mean()
+        # --- optional regularisers ---
+        # L_rho: keep event response magnitudes small (mean over active (i,j))
+        n_active = active.sum().clamp_min(1.0)
+        L_rho = (rho ** 2 * active).sum() / n_active
+        # L_ent: attribution entropy term sum_i pi log pi (maximise entropy ->
+        # minimise sum pi log pi) to discourage degenerate collapse.
+        plogp = torch.where(pi_bar > 0, pi_bar * torch.log(pi_bar.clamp_min(1e-12)),
+                            torch.zeros_like(pi_bar))
+        n_has = has_active.sum().clamp_min(1.0)
+        L_ent = plogp.sum() / n_has
+
+        loss = nll.mean() + self.w_mean * mean_loss.mean() \
+            + self.w_rho * L_rho + self.w_ent * L_ent
 
         cache = {
             "log_w": log_w, "a": a, "b2": b2, "x_next": x_next,
             "params": params, "pi_bar": pi_bar, "active": active,
             "has_active": has_active, "mean_pred": mean_pred, "rho": rho,
             "nll": nll, "mean_loss": mean_loss, "extra": extra,
+            "L_rho": L_rho, "L_ent": L_ent, "dXY": dXY,
             "h_grid": h_grid, "Z_grid": Z_grid,
         }
         return loss, cache

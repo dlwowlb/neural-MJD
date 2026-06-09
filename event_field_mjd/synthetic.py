@@ -1,137 +1,211 @@
-"""Synthetic data generator for the Event-Field Marked MJD model.
+"""Event-conditioned marked MJD synthetic generator.
 
-This mirrors the spirit of the Neural-MJD synthetic demo (``demo_notebook.ipynb``):
-we fabricate data with a *known* generative process so that we can check whether
-the model recovers the structure it is supposed to learn.
+This is the *data-generating process (DGP)* that matches our model's
+assumptions, in the same spirit that Neural-MJD validates itself on data drawn
+from a Merton jump-diffusion. Whereas plain MJD only has "how many jumps", here
+every latent jump additionally carries a **source mark** -- background (`r=0`)
+or "caused by event `e_i`" (`r=i`) -- so we get ground-truth response counts and
+per-event signed contributions and can score *attribution recovery*, not just
+forecasting.
 
-The generative story (CGM-glucose flavoured, but generic):
+DGP (one line):
 
-* A dense sensor grid ``t_j = j * dt`` carries a log-state ``X_t = log S_t`` that
-  mean-reverts to a per-sequence baseline and is perturbed by small diffusion
-  noise (eq. 30: ``dX_t = (mu - kappa - 0.5 sigma^2) dt + sigma dW`` without the
-  jump term, plus the additive contributions below).
-* Irregular events ``e_i = (tau_i, x_i)`` arrive at times that are *not* aligned
-  with the sensor grid (eq. 1-4). Each event injects an additive **log-response**
-  that rises to a persistent signed level over the attribution window ``W`` (this
-  plays the role of the shared response field driving response jumps, eqs. 8-10,
-  22, 25-26); the trajectory later relaxes to baseline through mean reversion,
-  not through the event -- matching a jump-diffusion's inductive bias.
-* A handful of rare **background jumps** unexplained by any event are injected
-  (eq. 21, 23) so the model has to separate "event-attributed" from "background".
+    observed events  ->  lambda_resp^GT, pi_i^GT, magnitude law
+                     ->  marked latent jump counter N^E(dt,dy,dr)
+                     ->  trajectory X_t = log S_t
 
-Crucially we record, per sensor interval ``I_j`` and per event ``i``, the exact
-log-space contribution ``gt_R[i, j]`` that event ``i`` made to that interval.
-This is the ground-truth analogue of the model's signed log-response
-``R_{i,j} = A_{i,j} * nu_resp`` (eq. 66) and lets us measure attribution recovery.
+Pipeline (matches the spec Steps 1-8):
+
+1. Sample events  e_i = (tau_i, c_i, m_i): time, type, magnitude.
+2. Per-event delayed response kernel  g_i(t) = alpha_{c_i} m_i K_{c_i}(t-tau_i)
+   on  0 < t-tau_i < W   (K = Gamma pdf -> delayed peak).
+3. True response intensity   lambda_resp^GT(t) = lambda_min + sum_{i in A_t} g_i(t).
+4. True attribution share     pi_i^GT(t) = g_i(t) / sum_l g_l(t).
+5. Background intensity        lambda_bg^GT(t) = lambda_bg0.
+6. Sample the marked jump counter on a fine grid: for each fine step draw
+   Poisson background / response counts; each response jump's source is drawn
+   from pi^GT(t); record (time, mark, logY).
+7. Response magnitude  log Y_i ~ N(nu_{c_i} m_i, gamma_resp^2) with type-signed
+   nu (meal/stress > 0, insulin/exercise < 0); background  log Y ~ N(0,gamma_bg^2).
+8. Integrate  X_{n+1} = X_n + mu^GT dt + sigma^GT sqrt(dt) eps + sum logY.
+
+Ground truth saved per sensor interval I_j: K_bg^GT, K_resp^GT, per-event count
+K_{i,j}^GT, and signed contribution R_{i,j}^GT = sum of logY of jumps marked i.
 """
 
 import math
 import numpy as np
 import torch
 
+# event types and their (intensity scale alpha, magnitude mean coef nu,
+# Gamma kernel shape k, Gamma kernel scale theta)
+EVENT_TYPES = ["meal", "insulin", "exercise", "stress"]
+TYPE_PARAMS = {
+    #            alpha   nu      k     theta
+    "meal":     (1.0,   +0.16,  2.5,  1.1),   # raises glucose, delayed peak
+    "insulin":  (1.0,   -0.16,  2.0,  0.9),   # lowers glucose
+    "exercise": (0.9,   -0.13,  2.2,  1.4),   # lowers, slower
+    "stress":   (0.8,   +0.10,  1.5,  1.0),   # raises, fast
+}
 
-def _bump(s, tau_kernel):
-    """Causal, monotonic, *persistent* response kernel.
 
-    g(s) = 1 - exp(-s / tau) for s > 0, else 0  (saturates at 1).
-
-    The cumulative log-response of an event rises from 0 to its full amplitude
-    over a few intervals and then *stays* there; the trajectory returns to
-    baseline through the global mean-reversion drift, not through the event.
-    This matches a jump-diffusion's inductive bias (the event = a signed jump,
-    the relaxation = endogenous drift) and -- unlike a rise-then-decay bump --
-    makes each event's net signed contribution well-defined and non-degenerate.
-    """
-    out = np.zeros_like(s)
-    pos = s > 0
-    out[pos] = 1.0 - np.exp(-s[pos] / tau_kernel)
+def _gamma_pdf(u, k, theta):
+    """Gamma(k, theta) density for u > 0, else 0. Vectorised over u."""
+    out = np.zeros_like(u)
+    pos = u > 0
+    up = u[pos]
+    out[pos] = up ** (k - 1.0) * np.exp(-up / theta) / (math.gamma(k) * theta ** k)
     return out
 
 
 def generate_dataset(
-    num_samples=512,
-    T=48,                # number of sensor intervals (T+1 grid points)
-    dt=1.0,              # sensor spacing Delta_y
+    num_samples=768,
+    T=48,                  # number of sensor intervals (T+1 grid points)
+    dt=1.0,                # sensor spacing Delta_y
+    fine_per_interval=20,  # latent jumps simulated on a finer grid
     n_events_range=(3, 7),
-    W=8.0,               # attribution window
-    tau_kernel=1.5,      # response rise time-constant (time to ~63% of amplitude)
-    resp_scale=0.25,     # max |log-response| amplitude per unit feature
-    mean_revert=0.15,    # mean-reversion strength (relaxes the level back to baseline)
-    diffusion=0.02,      # diffusion sigma (log-space, per sqrt(dt))
-    bg_jump_prob=0.01,   # per-interval probability of a background jump
-    bg_jump_scale=0.15,  # background jump log-magnitude std
+    W=8.0,                 # response window (shared across types)
+    lambda_min=0.04,       # baseline response intensity floor
+    lambda_bg0=0.05,       # background jump intensity
+    gamma_resp=0.05,       # response log-jump magnitude std
+    gamma_bg=0.10,         # background log-jump magnitude std
+    mr_rate=0.10,          # mean-reversion rate of the drift
+    sigma_diff=0.01,       # diffusion sigma (log-space, per sqrt(time))
+    mag_scale=1.0,         # global multiplier on response magnitude mean
+    max_delay=2.0,         # per-event response onset delay ~ U(0, max_delay)
+    personal_scale_sigma=0.2,  # per-subject latent effect scaling (unseen by model)
     baseline_log_range=(math.log(80.0), math.log(120.0)),
     seed=0,
 ):
-    """Return a dict of padded tensors describing ``num_samples`` sequences.
-
-    Event features ``x_i`` are scalar signed magnitudes in [-1, 1]; positive
-    means an up-response (e.g. a meal raising glucose), negative a down-response
-    (e.g. exercise lowering it). This lets us check that the model recovers both
-    the magnitude *and the sign* of each event's effect.
-    """
     rng = np.random.default_rng(seed)
-    grid = np.arange(T + 1) * dt                       # [T+1]
+    n_types = len(EVENT_TYPES)
     M_max = n_events_range[1]
+    n_fine = T * fine_per_interval
+    dt_fine = dt / fine_per_interval
+    grid = np.arange(T + 1) * dt                          # [T+1] sensor times
+    t_fine = np.arange(n_fine + 1) * dt_fine              # [n_fine+1]
 
     X = np.zeros((num_samples, T + 1), dtype=np.float32)
     tau = np.zeros((num_samples, M_max), dtype=np.float32)
-    x_feat = np.zeros((num_samples, M_max, 1), dtype=np.float32)
+    x_feat = np.zeros((num_samples, M_max, n_types + 1), dtype=np.float32)  # onehot(type)+m
     evt_mask = np.zeros((num_samples, M_max), dtype=np.float32)
-    gt_R = np.zeros((num_samples, M_max, T), dtype=np.float32)   # per-event per-interval log-contribution
-    gt_bg = np.zeros((num_samples, T), dtype=np.float32)         # background log-contribution per interval
 
-    total_horizon = T * dt
+    gt_R = np.zeros((num_samples, M_max, T), dtype=np.float32)      # signed contribution R_{i,j}
+    gt_K_evt = np.zeros((num_samples, M_max, T), dtype=np.float32)  # per-event response count
+    gt_K_resp = np.zeros((num_samples, T), dtype=np.float32)        # total response count
+    gt_K_bg = np.zeros((num_samples, T), dtype=np.float32)          # background count
+    gt_bg_R = np.zeros((num_samples, T), dtype=np.float32)          # signed background contribution
+    gt_delay = np.zeros((num_samples, M_max), dtype=np.float32)     # per-event onset delay
+    gt_amp = np.zeros((num_samples, M_max), dtype=np.float32)       # per-event signed effect mean (nu_i)
+    gt_event_type = -np.ones((num_samples, M_max), dtype=np.int64)  # per-event type index
+    gt_baseline = np.zeros((num_samples,), dtype=np.float32)        # per-subject log baseline
+
+    horizon = T * dt
     for b in range(num_samples):
         baseline = rng.uniform(*baseline_log_range)
-        n_evt = rng.integers(n_events_range[0], n_events_range[1] + 1)
+        gt_baseline[b] = baseline
+        # per-subject latent gain that the model never observes -> the event
+        # feature (type, magnitude) no longer fully reveals the response.
+        personal = float(rng.lognormal(0.0, personal_scale_sigma))
+        n_evt = int(rng.integers(n_events_range[0], n_events_range[1] + 1))
 
-        # Irregular event times deliberately off-grid (eq. 4: tau_i not in T).
-        taus = np.sort(rng.uniform(0.05 * total_horizon, 0.9 * total_horizon, size=n_evt))
-        taus = taus + 0.5 * dt * rng.uniform(-0.4, 0.4, size=n_evt)   # jitter off grid
-        amps = rng.uniform(-1.0, 1.0, size=n_evt) * resp_scale
-        # mark feature is the *signed magnitude* (what the model observes as x_i)
-        feats = (amps / resp_scale).astype(np.float32)
+        # ---- Step 1: events (time, type, magnitude), off the sensor grid
+        taus = np.sort(rng.uniform(0.05 * horizon, 0.85 * horizon, size=n_evt))
+        taus = taus + 0.5 * dt * rng.uniform(-0.4, 0.4, size=n_evt)
+        type_idx = rng.integers(0, n_types, size=n_evt)
+        mags = rng.uniform(0.5, 1.5, size=n_evt)
+        delays = rng.uniform(0.0, max_delay, size=n_evt)       # per-event onset delay
 
         tau[b, :n_evt] = taus
-        x_feat[b, :n_evt, 0] = feats
-        evt_mask[b, :n_evt] = 1.0
-
-        # Per-event cumulative log-response evaluated on the grid.
-        # response_i(t) = amp_i * bump(t - tau_i); contribution to interval j is the
-        # difference of the cumulative response across the interval endpoints.
-        resp_cum = np.zeros((n_evt, T + 1), dtype=np.float32)
         for i in range(n_evt):
-            resp_cum[i] = amps[i] * _bump(grid - taus[i], tau_kernel)
-        gt_R[b, :n_evt, :] = resp_cum[:, 1:] - resp_cum[:, :-1]      # [n_evt, T]
+            x_feat[b, i, type_idx[i]] = 1.0           # one-hot type
+            x_feat[b, i, n_types] = mags[i]           # magnitude (observed)
+        evt_mask[b, :n_evt] = 1.0
+        gt_delay[b, :n_evt] = delays
+        gt_event_type[b, :n_evt] = type_idx
 
-        # Background jumps: rare, event-independent.
-        bg = np.zeros(T, dtype=np.float32)
-        fire = rng.random(T) < bg_jump_prob
-        bg[fire] = rng.normal(0.0, bg_jump_scale, size=fire.sum()).astype(np.float32)
-        gt_bg[b] = bg
+        # ---- Step 2: per-event response kernels g_i on the fine grid.
+        # Response starts only after an onset delay and is hard-windowed to
+        # 0 < (t - tau_i - delay_i) < W (explicit attribution window).
+        g = np.zeros((n_evt, n_fine + 1), dtype=np.float64)     # [n_evt, n_fine+1]
+        nu_i = np.zeros(n_evt)                                  # per-event signed magnitude mean
+        for i in range(n_evt):
+            ctype = EVENT_TYPES[type_idx[i]]
+            alpha, nu, k, theta = TYPE_PARAMS[ctype]
+            u = t_fine - taus[i] - delays[i]
+            kern = _gamma_pdf(u, k, theta)
+            kern[(u <= 0) | (u >= W)] = 0.0                     # window 0<u<W
+            g[i] = alpha * mags[i] * kern
+            # true signed effect mean: type sign x magnitude x latent personal gain
+            nu_i[i] = mag_scale * nu * mags[i] * personal
+        gt_amp[b, :n_evt] = nu_i
 
-        # Roll out the log-trajectory.
+        # ---- Steps 3-4: response intensity and attribution share on fine grid
+        g_sum = g.sum(axis=0)                                   # [n_fine+1]
+        lam_resp = lambda_min + g_sum                           # lambda_resp^GT(t)
+        # only "on" where at least one event active; floor still allows rare jumps
+        active_any = g_sum > 1e-8
+        pi_gt = np.zeros_like(g)
+        pi_gt[:, active_any] = g[:, active_any] / g_sum[active_any]      # sums to 1 exactly
+
+        # ---- Steps 6-8: simulate the marked jump counter + trajectory
         x = baseline
         X[b, 0] = x
-        for j in range(T):
-            drift = mean_revert * (baseline - x) * dt
-            diff = diffusion * math.sqrt(dt) * rng.normal()
-            resp = float(gt_R[b, :n_evt, j].sum())
-            x = x + drift + diff + resp + bg[j]
-            X[b, j + 1] = x
+        # accumulators indexed by sensor interval
+        for n in range(n_fine):
+            t_n = t_fine[n]
+            j = min(int(t_n // dt), T - 1)                      # sensor interval index
+
+            # smooth drift (mean reversion) + diffusion
+            drift = mr_rate * (baseline - x) * dt_fine
+            diff = sigma_diff * math.sqrt(dt_fine) * rng.normal()
+            x = x + drift + diff
+
+            # background jumps  r=0
+            k_bg = rng.poisson(lambda_bg0 * dt_fine)
+            for _ in range(k_bg):
+                logY = rng.normal(0.0, gamma_bg)
+                x += logY
+                gt_K_bg[b, j] += 1
+                gt_bg_R[b, j] += logY
+
+            # response jumps  r=i, only if some event active here
+            lam_r = lam_resp[n]
+            if active_any[n] and lam_r > 0:
+                k_resp = rng.poisson(lam_r * dt_fine)
+                p_src = pi_gt[:, n] / pi_gt[:, n].sum()         # guard fp drift
+                for _ in range(k_resp):
+                    src = rng.choice(n_evt, p=p_src)            # source ~ pi^GT(t)
+                    logY = rng.normal(nu_i[src], gamma_resp)
+                    x += logY
+                    gt_K_resp[b, j] += 1
+                    gt_K_evt[b, src, j] += 1
+                    gt_R[b, src, j] += logY
+
+            # record sensor observation at interval boundaries
+            if (n + 1) % fine_per_interval == 0:
+                X[b, (n + 1) // fine_per_interval] = x
 
     out = {
-        "X": torch.from_numpy(X),                       # [B, T+1] log-states
-        "S": torch.from_numpy(np.exp(X)),               # [B, T+1] raw states
-        "tau": torch.from_numpy(tau),                   # [B, M]
-        "x_feat": torch.from_numpy(x_feat),             # [B, M, 1]
-        "evt_mask": torch.from_numpy(evt_mask),         # [B, M]
-        "grid": torch.from_numpy(grid.astype(np.float32)),  # [T+1]
-        "gt_R": torch.from_numpy(gt_R),                 # [B, M, T] ground-truth signed log-contribution
-        "gt_bg": torch.from_numpy(gt_bg),               # [B, T]
+        "X": torch.from_numpy(X),                              # [B, T+1] log-states
+        "S": torch.from_numpy(np.exp(X)),                      # [B, T+1] raw states
+        "tau": torch.from_numpy(tau),                          # [B, M]
+        "x_feat": torch.from_numpy(x_feat),                    # [B, M, n_types+1]
+        "evt_mask": torch.from_numpy(evt_mask),                # [B, M]
+        "grid": torch.from_numpy(grid.astype(np.float32)),     # [T+1]
+        "gt_R": torch.from_numpy(gt_R),                        # [B, M, T] signed contribution
+        "gt_K_evt": torch.from_numpy(gt_K_evt),                # [B, M, T] per-event count
+        "gt_K_resp": torch.from_numpy(gt_K_resp),              # [B, T] response count
+        "gt_K_bg": torch.from_numpy(gt_K_bg),                  # [B, T] background count
+        "gt_bg_R": torch.from_numpy(gt_bg_R),                  # [B, T] signed background contribution
+        "gt_delay": torch.from_numpy(gt_delay),                # [B, M] per-event onset delay
+        "gt_amp": torch.from_numpy(gt_amp),                    # [B, M] per-event signed effect mean
+        "gt_event_type": torch.from_numpy(gt_event_type),      # [B, M] type index (-1 = pad)
+        "gt_baseline": torch.from_numpy(gt_baseline),          # [B] log baseline
         "meta": {"T": T, "dt": dt, "W": W, "M_max": M_max,
-                 "tau_kernel": tau_kernel, "resp_scale": resp_scale},
+                 "n_types": n_types, "x_feat_dim": n_types + 1,
+                 "event_types": EVENT_TYPES, "max_delay": max_delay,
+                 "personal_scale_sigma": personal_scale_sigma},
     }
     return out
 
@@ -146,9 +220,7 @@ def train_test_split(data, frac=0.8, seed=0):
     def _subset(idx):
         sub = {}
         for k, v in data.items():
-            if k == "meta":
-                sub[k] = v
-            elif k == "grid":
+            if k in ("meta", "grid"):
                 sub[k] = v
             else:
                 sub[k] = v[idx]
