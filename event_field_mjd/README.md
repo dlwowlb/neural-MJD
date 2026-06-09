@@ -26,20 +26,40 @@ jump-diffusion mixture. Per-event attribution is then recovered as a
 
 ```bash
 cd event_field_mjd
-python validate.py                 # full run (~120 epochs, CPU-friendly)
+python validate.py                 # full run (~250 epochs, CPU-friendly)
 python validate.py --epochs 30 --num_samples 256 --no_plot   # quick check
+# regulariser weights are tunable: --w_mean --w_rho --w_ent
 ```
+
+## Training objective
+
+```
+L = L_NLL  +  w_mean · L_route  +  w_rho · L_rho  +  w_ent · L_ent
+```
+
+- `L_NLL  = −Σ_j log p_κ(X_{t_{j+1}} | X_{t_j}, E, C_j)`  — the collapsed truncated
+  likelihood (eqs. 56–58). Trains drift/diffusion, both intensities, both jump
+  magnitudes, and the field `Z`.
+- `L_route = Σ_j ‖ X_{t_{j+1}} − (X_{t_j} + ΔX^Y_j + Σ_i Λ^attr_{i,j} ρ_{i,j}) ‖²`
+  — self-supervised reconstruction. `ΔX^Y` is a **dedicated endogenous head**
+  `b_θ^Y(X_{t_j}, h_t^Y, Δ_j)`; the response term is routed through `π̄` and the
+  event magnitude `ρ`, which is the **only** gradient the attribution softmax /
+  trace receive (the collapsed `L_NLL` marginalises event identity). No
+  background term enters this reconstruction.
+- `L_rho = mean ρ²` — keeps event magnitudes small.
+- `L_ent = Σ π̄ log π̄` — entropy term (minimised → higher entropy) that
+  discourages degenerate attribution collapse.
 
 ## Representative result (250 epochs, CPU, held-out test set)
 
 | metric | value | reading |
 |--------|-------|---------|
-| NLL / interval | **−2.31** | likelihood converges |
-| one-step MAE (raw `S`) | **1.9** | ≈1.9 % on an `S≈100` scale |
-| attribution corr `R` vs GT | **0.68** (shuffle −0.02) | per-event signed response recovered |
-| event sign accuracy | **0.83** | up/down direction recovered |
-| response localization (`K_resp`) | **0.4–0.5** | response jumps land where events act |
-| background separation (`K_bg`) | **0.55** | background jumps land on real ones |
+| NLL / interval | **−2.29** | likelihood converges |
+| one-step MAE (raw `S`) | **1.82** | ≈1.8 % on an `S≈100` scale |
+| attribution corr `R` vs GT | **0.66** (shuffle −0.03) | per-event signed response recovered |
+| event sign accuracy | **0.88** | up/down direction recovered |
+| response localization (`K_resp`) | **0.3–0.4** | response jumps land where events act |
+| background separation (`K_bg`) | **0.56** | background jumps land on real ones |
 
 The attribution scatter (`outputs/03_attribution_scatter.png`) is clearly
 monotonic; magnitude is somewhat attenuated because `R = K_resp · π̄ · ρ` with
@@ -117,8 +137,11 @@ whenever active events are reasonably separated in time — which is what lifts
 | (65) prob ≥1 response jump | `model.attribute` (`P_resp`) |
 | (66) signed log-response `R_{i,j}` | `model.attribute` (`R_hat`, via `ρ`) |
 | (46) attributed intensity `Λ_attr` | `model.forward` (`Lam_attr`) |
-| (69–70) overall loss | `model.forward` (`loss`) |
-| event magnitude `ρ_{i,j}` (extension) | `model.attribution_shares` (`rho_head`) |
+| endogenous head `ΔX^Y = b_θ^Y(X,h,Δ)` | `model.forward` (`b_theta`, `dXY`) |
+| routed reconstruction `L_route` | `model.forward` (`mean_loss`) |
+| magnitude reg `L_ρ`, entropy reg `L_ent` | `model.forward` (`L_rho`, `L_ent`) |
+| overall loss `L = L_NLL + ω L_route + …` | `model.forward` (`loss`) |
+| event magnitude `ρ_{i,j} = ρ_max tanh r_θ(ζ,Z,h)` | `model.attribution_shares` (`rho_head`) |
 
 ## Modelling choices / approximations
 

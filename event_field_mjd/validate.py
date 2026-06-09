@@ -140,6 +140,9 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--kappa_trunc", type=int, default=4)
+    ap.add_argument("--w_mean", type=float, default=1.0)
+    ap.add_argument("--w_rho", type=float, default=1e-3)
+    ap.add_argument("--w_ent", type=float, default=1e-3)
     ap.add_argument("--no_plot", action="store_true")
     args = ap.parse_args()
 
@@ -157,7 +160,8 @@ def main():
           f"T={data['meta']['T']}, W={W}")
 
     # ----- model
-    model = EventFieldMJD(x_feat_dim=1, kappa_trunc=args.kappa_trunc, W=W, dt=dt).to(device)
+    model = EventFieldMJD(x_feat_dim=1, kappa_trunc=args.kappa_trunc, W=W, dt=dt,
+                          w_mean=args.w_mean, w_rho=args.w_rho, w_ent=args.w_ent).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
