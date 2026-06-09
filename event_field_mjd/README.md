@@ -109,23 +109,42 @@ L = L_NLL  +  w_mean · L_route  +  w_rho · L_rho  +  w_ent · L_ent
 > look good while interval-level attribution is wrong).
 >
 > **Root cause.** The NLL drift `μ = p_θ(h_t^Y)` is conditioned on the causal
-> trajectory encoding `h`, which already reflects the ongoing event response, so
-> `μ` can predict the response-driven increment with **zero response jumps**. The
-> likelihood is then indifferent to `λ_resp`, `π`, `ρ`, leaving attribution to a
-> weak self-supervised signal (`L_route`) whose optimisation is **bimodal**
-> (correct- vs flipped-sign basins). Restricting the *endogenous* head `b_θ`
-> alone does **not** fix it (tested), because the absorption happens in `μ`.
+> trajectory encoding `h`. Even though `h` excludes explicit event *marks*, its
+> input is the observed trajectory `X`, which **already contains the event-driven
+> rise/fall** — so `μ` can predict the response-driven increment with **zero
+> response jumps**. The likelihood is then indifferent to `λ_resp`, `π`, `ρ`,
+> leaving attribution to a weak self-supervised signal (`L_route`) whose
+> optimisation is **bimodal** (correct- vs flipped-sign basins). Restricting the
+> *endogenous* head `b_θ` alone does **not** fix it, because the absorption
+> happens in `μ` (which still sees `X`).
 >
-> **Partial fix — `--couple_attr` (off by default; deviates from spec eq. 26/52).**
-> Makes the NLL response magnitude attribution-derived, `ν̄_j = Σ_i π̄_{i,j} ρ_{i,j}`,
-> so the likelihood depends on `π,ρ` directly. Multi-seed (150 ep): it **helps but
-> does not fully solve** the problem — one seed recovered counts strongly
-> (count-corr ≈ 0.69, resp-loc ≈ 0.85) while others stayed stuck (sign ≈ 0.23).
-> Reason: the coupling only matters when response jumps actually carry likelihood
-> weight, but the drift `μ=p_θ(h)` still absorbs the response so `λ_resp→0` on the
-> stuck seeds. A complete fix additionally needs to stop `μ` from seeing
-> event-correlated history (or to penalise `λ_resp→0`) so the response channel is
-> forced to fire. That is a larger model change and is left as the next step.
+> **Fix #1 — `--endo_baseline` (the principled change).** Factorise the dynamics
+> into an *endogenous baseline* and *exogenous event response*,
+> `X_t = B_t + R_t`, and condition the smooth drift/diffusion (and the endogenous
+> mean head) on the **event-free baseline** `B_t = X_t − R_t` instead of the raw
+> trajectory. `R_t` is a stop-grad cumulative estimate of the routed response
+> (two-pass: estimate `R` from raw `X`, subtract, then model on `B`). This is a
+> *modelling assumption*, not a penalty: `μ` now physically cannot absorb the
+> event-driven increment, so the response channel must explain it. Multi-seed
+> (150 ep) result: it produces the **first runs with the correct sign** (e.g.
+> seed 1: sign-acc ≈ 0.56, count-corr ≈ 0.38) where the spec objective was always
+> *anti-correlated* (~0.2). **But it is still seed-dependent** — some seeds stay
+> in the flipped basin — so `μ`-deconfounding alone does not fully stabilise it.
+>
+> **Bridge — `--couple_attr` (off by default; deviates from spec eq. 26/52).**
+> Makes the NLL response magnitude attribution-derived, `ν̄_j = Σ_i π̄_{i,j} ρ_{i,j}`.
+> On its own (150 ep) it partially helps (one seed count-corr ≈ 0.69) but stalls
+> when `λ_resp→0`; combined with `--endo_baseline` it did not add over endo alone.
+>
+> **Why it is still unstable → motivates Fix #2 (marked likelihood).** The
+> *collapsed* likelihood marginalises event identity (single total `k_resp`,
+> shared magnitude), so `π,ρ` receive **no direct likelihood gradient** and the
+> sign symmetry is never broken at the likelihood level — only by the auxiliary
+> mean, which is bimodal. The natural next step is to **retain the source marks
+> inside the truncated likelihood** (per-event counts `k_1,…,k_M`, per-event
+> `ρ_i,γ_i`), so attribution is identified by the likelihood itself. This is the
+> "causally-factorised marked EF-MJD" direction; `--endo_baseline` is its first
+> component and the multi-seed evidence above is exactly the motivation for it.
 
 > **Validation scope.** This is the **Level-1, model-matched** check: the DGP
 > obeys the model's own assumptions, so strong recovery is the *expected* sanity

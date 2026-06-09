@@ -84,9 +84,15 @@ class EventFieldMJD(nn.Module):
                            # weighted event magnitude nu_bar = sum_i pi_bar_i * rho_i
                            # (couples pi/rho into the likelihood -> identifiable);
                            # default False keeps the spec-faithful shared m_resp.
+        endo_baseline=False, # if True, factorise X_t = B_t + R_t and condition the
+                           # smooth drift/diffusion (and endogenous mean head) on the
+                           # *event-free baseline* B_t = X_t - R_t instead of the raw
+                           # observed trajectory. Stops mu from absorbing event-driven
+                           # increments (the identifiability failure). Off = spec.
     ):
         super().__init__()
         self.couple_attr = couple_attr
+        self.endo_baseline = endo_baseline
         self.d_h, self.d_z, self.d_evt = d_h, d_z, d_evt
         self.kappa_trunc = kappa_trunc
         self.W = W
@@ -341,12 +347,44 @@ class EventFieldMJD(nn.Module):
                                       "kappa": kappa, "drift": drift,
                                       "nu_rp": nu_rp}
 
+    def _response_increment(self, params, pi_bar, has_active, rho):
+        """Per-interval routed response increment R_j = sum_i Lambda_attr_{i,j} rho_{i,j}
+        (eq. 46/70). Returns [B, T]."""
+        Lam_rp = (params["lam_rp"] * has_active) * self.dt        # [B, T]
+        return (Lam_rp.unsqueeze(-1) * pi_bar * rho).sum(dim=-1)  # [B, T]
+
+    def _baseline_trajectory(self, batch):
+        """Endogenous baseline B_t = X_t - R_t for the event-free drift.
+
+        Pass-1 *stop-grad* estimate of the cumulative event response R_t from the
+        raw observed trajectory, subtracted off so the smooth drift sees only the
+        endogenous part. Detached so the baseline subtraction is not itself a
+        training path for the response heads (which would let the model explain
+        everything as response and collapse B to a constant); the heads are still
+        trained normally in the main pass. Returns B_traj [B, T+1]."""
+        X = batch["X"]
+        tau, x_feat, evt_mask, grid = batch["tau"], batch["x_feat"], batch["evt_mask"], batch["grid"]
+        with torch.no_grad():
+            h0 = self.encode_history(X, tau, x_feat, evt_mask, grid)
+            Z0 = self.rollout_field(h0, tau, x_feat, evt_mask, grid)
+            params0 = self.interval_params(h0, Z0)
+            pi0, _, has0, rho0 = self.attribution_shares(
+                h0, Z0, tau, x_feat, evt_mask, grid)
+            resp0 = self._response_increment(params0, pi0, has0, rho0)   # [B, T]
+            R_cum = torch.zeros_like(X)
+            R_cum[:, 1:] = torch.cumsum(resp0, dim=1)                    # response in level X_{t_j}
+        return X - R_cum                                                # detached via no_grad
+
     def forward(self, batch):
         """Compute NLL, auxiliary mean loss, and cache quantities for attribution."""
         X = batch["X"]
         tau, x_feat, evt_mask, grid = batch["tau"], batch["x_feat"], batch["evt_mask"], batch["grid"]
 
-        h_grid = self.encode_history(X, tau, x_feat, evt_mask, grid)
+        # endogenous baseline: condition the smooth drift on B_t = X_t - R_t so it
+        # cannot absorb event-driven increments (off -> raw trajectory == spec).
+        X_endo = self._baseline_trajectory(batch) if self.endo_baseline else X
+
+        h_grid = self.encode_history(X_endo, tau, x_feat, evt_mask, grid)
         Z_grid = self.rollout_field(h_grid, tau, x_feat, evt_mask, grid)
         params = self.interval_params(h_grid, Z_grid)
         pi_bar, active, has_active, rho = self.attribution_shares(
@@ -367,9 +405,11 @@ class EventFieldMJD(nn.Module):
         # background, no event info); response term routed through pi_bar and rho
         # so the attribution softmax / trace get a gradient (the collapsed NLL
         # marginalises event identity and cannot train them).
-        x_cur = X[:, :-1]                                          # [B, T]
+        x_cur = X[:, :-1]                                          # [B, T] observed level
         h_j = h_grid[:, :-1]                                       # [B, T, d_h]
-        x_rel = (x_cur - X[:, :1])                                 # current level offset
+        # endogenous head sees the *baseline* level offset (event-free), matching
+        # the baseline history h_j; reconstruction is still onto observed x_next.
+        x_rel = (X_endo[:, :-1] - X_endo[:, :1])                   # baseline level offset
         dt_feat = torch.full_like(x_cur, self.dt)
         endo_in = torch.cat([h_j, x_rel.unsqueeze(-1), dt_feat.unsqueeze(-1)], dim=-1)
         dXY = self.b_theta(endo_in).squeeze(-1)                    # DeltaX^Y  [B, T]

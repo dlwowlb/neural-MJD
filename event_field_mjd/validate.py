@@ -162,7 +162,8 @@ def train_efmjd(args, train_data, W, dt, x_feat_dim, device, epochs, log=False):
     """Train an EventFieldMJD on ``train_data``; returns (model, loss_curve)."""
     model = EventFieldMJD(x_feat_dim=x_feat_dim, kappa_trunc=args.kappa_trunc, W=W, dt=dt,
                           w_mean=args.w_mean, w_rho=args.w_rho, w_ent=args.w_ent,
-                          couple_attr=args.couple_attr).to(device)
+                          couple_attr=args.couple_attr,
+                          endo_baseline=args.endo_baseline).to(device)
     if log:
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\nTraining...")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -242,6 +243,10 @@ def main():
     ap.add_argument("--couple_attr", action="store_true",
                     help="couple attribution (pi,rho) into the NLL response magnitude "
                          "(identifiable but deviates from spec eq.26/52); default off")
+    ap.add_argument("--endo_baseline", action="store_true",
+                    help="factorise X=B+R and condition the smooth drift on the "
+                         "event-free baseline B (stops drift from absorbing events); "
+                         "default off")
     # --- DGP knobs (overlap + Synthetic-III misspecification) ---
     ap.add_argument("--event_span_frac", type=float, default=0.80)  # smaller = more overlap
     ap.add_argument("--max_delay", type=float, default=2.0)
