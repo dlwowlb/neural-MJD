@@ -163,7 +163,9 @@ def train_efmjd(args, train_data, W, dt, x_feat_dim, device, epochs, log=False):
     model = EventFieldMJD(x_feat_dim=x_feat_dim, kappa_trunc=args.kappa_trunc, W=W, dt=dt,
                           w_mean=args.w_mean, w_rho=args.w_rho, w_ent=args.w_ent,
                           couple_attr=args.couple_attr,
-                          endo_baseline=args.endo_baseline).to(device)
+                          endo_baseline=args.endo_baseline,
+                          marked_lik=args.marked_lik,
+                          marked_cap=args.marked_cap).to(device)
     if log:
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\nTraining...")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -247,6 +249,12 @@ def main():
                     help="factorise X=B+R and condition the smooth drift on the "
                          "event-free baseline B (stops drift from absorbing events); "
                          "default off")
+    ap.add_argument("--marked_lik", action="store_true",
+                    help="exact marked truncated likelihood (per-event counts/marks) "
+                         "so pi/rho get a direct likelihood gradient; default off "
+                         "(collapsed, spec-faithful)")
+    ap.add_argument("--marked_cap", type=int, default=3,
+                    help="# of top-pi active events given individual marks per interval")
     # --- DGP knobs (overlap + Synthetic-III misspecification) ---
     ap.add_argument("--event_span_frac", type=float, default=0.80)  # smaller = more overlap
     ap.add_argument("--max_delay", type=float, default=2.0)

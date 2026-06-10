@@ -136,15 +136,39 @@ L = L_NLL  +  w_mean · L_route  +  w_rho · L_rho  +  w_ent · L_ent
 > On its own (150 ep) it partially helps (one seed count-corr ≈ 0.69) but stalls
 > when `λ_resp→0`; combined with `--endo_baseline` it did not add over endo alone.
 >
-> **Why it is still unstable → motivates Fix #2 (marked likelihood).** The
-> *collapsed* likelihood marginalises event identity (single total `k_resp`,
-> shared magnitude), so `π,ρ` receive **no direct likelihood gradient** and the
-> sign symmetry is never broken at the likelihood level — only by the auxiliary
-> mean, which is bimodal. The natural next step is to **retain the source marks
-> inside the truncated likelihood** (per-event counts `k_1,…,k_M`, per-event
-> `ρ_i,γ_i`), so attribution is identified by the likelihood itself. This is the
-> "causally-factorised marked EF-MJD" direction; `--endo_baseline` is its first
-> component and the multi-seed evidence above is exactly the motivation for it.
+> **Fix #2 — `--marked_lik` (exact marked likelihood).** The *collapsed*
+> likelihood marginalises event identity (single total `k_resp`, shared
+> magnitude), so `π,ρ` get **no direct likelihood gradient**. `--marked_lik`
+> replaces it with the exact marked truncated mixture: per interval the top-`cap`
+> active events are individual channels (count `k_i`, mean `ρ_i`, intensity
+> `λ_resp·π_i`), the rest a residual channel, and the likelihood sums over all
+> `(k_bg,k_1,…,k_cap,k_resid)` with total `≤ κ`. Now each per-event count enters
+> both the Poisson weight and the Gaussian mean, so the likelihood is no longer
+> invariant to the split/sign.
+>
+> ### Consolidated multi-seed result (150 ep, seeds 0–3) — the real conclusion
+> | config | count-corr | sign-acc | resp-loc (best) |
+> |---|---|---|---|
+> | collapsed (spec) | ~0 / ~0 / .68 | .23 / .23 / .46 | — |
+> | `--endo_baseline` | .00 / **.38** / .25 | .19 / **.56** / .44 | — |
+> | `--marked_lik` | .01 / .02 / .21 / .04 | .32 / .16 / .52 / .22 | — |
+> | `--marked_lik --endo_baseline` | .02 / .06 / **.64** / .02 | .22 / .21 / **.57** / .53 | **0.85** |
+>
+> The fully factorised model (`--marked_lik --endo_baseline`) produces the
+> **strongest single run by far** — seed 2: count-corr 0.64, response
+> localization 0.85, correct sign (0.57) — a level the collapsed objective never
+> reaches. **But it is still seed-dependent: only ~1 in 4 seeds reaches that
+> basin.** This pattern is identical across *every* variant.
+>
+> **Conclusion — it is an optimisation-symmetry problem, not a likelihood one.**
+> The model *can* represent and fit the correct attribution (some seed always
+> finds it), and Fixes #1/#2 make that basin **higher-quality** (necessary), but
+> they do **not** make it **reliably reachable** from random init (not
+> sufficient). The residual failure is the sign/permutation symmetry of the
+> attribution at initialisation. The genuine remaining work is **symmetry
+> breaking** — e.g. a physiological/sign prior on `ρ` (priority 5), a warm-start
+> that anchors one event's sign, or an annealing schedule on the response channel
+> — *not* further changes to the likelihood, which is now correct.
 
 > **Validation scope.** This is the **Level-1, model-matched** check: the DGP
 > obeys the model's own assumptions, so strong recovery is the *expected* sanity

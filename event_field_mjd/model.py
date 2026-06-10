@@ -89,10 +89,20 @@ class EventFieldMJD(nn.Module):
                            # *event-free baseline* B_t = X_t - R_t instead of the raw
                            # observed trajectory. Stops mu from absorbing event-driven
                            # increments (the identifiability failure). Off = spec.
+        marked_lik=False,  # if True, use the *exact marked* truncated likelihood:
+                           # per-interval mixture over (k_bg, k_1..k_cap, k_resid)
+                           # with per-event magnitudes rho_i, so pi/rho get a DIRECT
+                           # likelihood gradient (breaks the sign symmetry the
+                           # collapsed likelihood leaves). Off = collapsed (spec).
+        marked_cap=3,      # # of top-pi active events given individual marks per
+                           # interval; the remaining active events are lumped into one
+                           # shared-magnitude residual response channel.
     ):
         super().__init__()
         self.couple_attr = couple_attr
         self.endo_baseline = endo_baseline
+        self.marked_lik = marked_lik
+        self.marked_cap = marked_cap
         self.d_h, self.d_z, self.d_evt = d_h, d_z, d_evt
         self.kappa_trunc = kappa_trunc
         self.W = W
@@ -152,6 +162,19 @@ class EventFieldMJD(nn.Module):
         kr = torch.tensor([p[1] for p in pairs], dtype=torch.float32)
         self.register_buffer("k_bg_grid", kb)        # [P]
         self.register_buffer("k_resp_grid", kr)      # [P]
+
+        # Marked count grid: tuples (k_0=bg, k_1..k_cap=top events, k_resid) with
+        # total <= kappa_trunc. Channel layout: [bg, cap event channels, residual].
+        if marked_lik:
+            C = marked_cap + 2
+            import itertools
+            mtuples = [t for t in itertools.product(range(kappa_trunc + 1), repeat=C)
+                       if sum(t) <= kappa_trunc]
+            self.register_buffer("mark_grid",
+                                 torch.tensor(mtuples, dtype=torch.float32))   # [Pm, C]
+            # 1 for response channels (everything but bg), used to sum K_resp
+            resp_chan = torch.zeros(C); resp_chan[1:] = 1.0
+            self.register_buffer("mark_resp_chan", resp_chan)                  # [C]
 
     # ------------------------------------------------------------------ #
     #  Encoders / latent fields
@@ -375,6 +398,83 @@ class EventFieldMJD(nn.Module):
             R_cum[:, 1:] = torch.cumsum(resp0, dim=1)                    # response in level X_{t_j}
         return X - R_cum                                                # detached via no_grad
 
+    def _marked_terms(self, X, params, pi_bar, rho, has_active):
+        """Exact marked truncated likelihood.
+
+        Builds a per-interval mixture over channel counts (k_bg, k_1..k_cap,
+        k_resid). Each top-pi event i is its own channel with intensity
+        ``lam_resp * pi_i`` and mean ``rho_i``; the remaining active events are a
+        single residual channel with the shared response magnitude. Because each
+        per-event count enters the mixture weight (Poisson) *and* the Gaussian
+        mean, the likelihood gives ``pi`` and ``rho`` a direct gradient and is no
+        longer invariant to the sign / split (unlike the collapsed form).
+
+        Returns log_w [B,T,Pm], a, b2, x_next, extra. ``extra`` carries the channel
+        magnitudes, the top-event indices and the residual share so ``attribute``
+        can map channel posteriors back to events.
+        """
+        B = X.shape[0]
+        T = params["mu"].shape[1]
+        dt = self.dt
+        cap = self.marked_cap
+        G = self.mark_grid                                  # [Pm, C]
+        Pm, C = G.shape
+
+        mu, sigma = params["mu"], params["sigma"]
+        nu_bg, gam_bg = params["nu_bg"], params["gam_bg"]
+        nu_rp, gam_rp = params["nu_rp"], params["gam_rp"]
+        lam_bg = params["lam_bg"]
+        lam_rp = params["lam_rp"] * has_active              # eq. 43 gating
+
+        # top-cap active events by attribution share
+        M = pi_bar.shape[-1]
+        k = min(cap, M)
+        pi_top, idx_top = torch.topk(pi_bar, k=k, dim=-1)   # [B,T,k]
+        rho_top = torch.gather(rho, -1, idx_top)            # [B,T,k]
+        if k < cap:                                         # pad if fewer events than cap
+            pad = cap - k
+            pi_top = F.pad(pi_top, (0, pad))
+            rho_top = F.pad(rho_top, (0, pad))
+            idx_top = F.pad(idx_top, (0, pad), value=-1)
+        pi_resid = (1.0 - pi_top.sum(-1)).clamp_min(0.0) * has_active   # [B,T]
+
+        # per-channel magnitude / std / intensity  -> [B,T,C]
+        gam_rp2 = gam_rp
+        nu_chan = torch.cat([nu_bg.unsqueeze(-1), rho_top, nu_rp.unsqueeze(-1)], dim=-1)
+        gam_chan = torch.cat([gam_bg.unsqueeze(-1),
+                              gam_rp2.unsqueeze(-1).expand(-1, -1, cap),
+                              gam_rp2.unsqueeze(-1)], dim=-1)
+        lam_chan = torch.cat([lam_bg.unsqueeze(-1),
+                              lam_rp.unsqueeze(-1) * pi_top,
+                              (lam_rp * pi_resid).unsqueeze(-1)], dim=-1)       # [B,T,C]
+        Lam_chan = lam_chan * dt
+
+        # compensator kappa_t (eq. 29): sum over all jump channels
+        kappa = (lam_chan * (torch.exp(nu_chan + 0.5 * gam_chan ** 2) - 1.0)).sum(-1)
+        drift = (mu - kappa - 0.5 * sigma ** 2) * dt
+
+        x_cur = X[:, :-1]                                   # [B,T]
+        x_next = X[:, 1:]
+
+        Ge = G.view(1, 1, Pm, C)
+        # Gaussian mean / variance per tuple
+        a = x_cur.unsqueeze(-1) + drift.unsqueeze(-1) \
+            + (Ge * nu_chan.unsqueeze(2)).sum(-1)                              # [B,T,Pm]
+        b2 = (sigma ** 2 * dt).unsqueeze(-1) \
+            + (Ge * (gam_chan ** 2).unsqueeze(2)).sum(-1)
+        # Poisson weight = product over channels
+        log_pois = poisson_logpmf(Ge.expand(B, T, Pm, C),
+                                  Lam_chan.unsqueeze(2)).sum(-1)               # [B,T,Pm]
+        log_gauss = gaussian_logpdf(x_next.unsqueeze(-1), a, b2)
+        log_w = log_pois + log_gauss
+
+        Lam_rp_tot = (lam_rp * dt)                          # total response intensity [B,T]
+        extra = {"Lam_bg": lam_bg * dt, "Lam_rp": Lam_rp_tot,
+                 "kappa": kappa, "drift": drift, "nu_rp": nu_rp,
+                 "idx_top": idx_top, "rho_top": rho_top, "pi_resid": pi_resid,
+                 "nu_chan": nu_chan}
+        return log_w, a, b2, x_next, extra
+
     def forward(self, batch):
         """Compute NLL, auxiliary mean loss, and cache quantities for attribution."""
         X = batch["X"]
@@ -390,10 +490,15 @@ class EventFieldMJD(nn.Module):
         pi_bar, active, has_active, rho = self.attribution_shares(
             h_grid, Z_grid, tau, x_feat, evt_mask, grid)
 
-        # couple_attr: feed the attribution-weighted event magnitude into the NLL
-        nu_rp_override = (pi_bar * rho).sum(dim=-1) if self.couple_attr else None  # [B,T]
-        log_w, a, b2, x_next, extra = self._collapsed_terms(
-            X, params, has_active, nu_rp_override=nu_rp_override)
+        if self.marked_lik:
+            # exact marked likelihood -> pi/rho get a direct likelihood gradient
+            log_w, a, b2, x_next, extra = self._marked_terms(
+                X, params, pi_bar, rho, has_active)
+        else:
+            # couple_attr: feed the attribution-weighted event magnitude into the NLL
+            nu_rp_override = (pi_bar * rho).sum(dim=-1) if self.couple_attr else None  # [B,T]
+            log_w, a, b2, x_next, extra = self._collapsed_terms(
+                X, params, has_active, nu_rp_override=nu_rp_override)
 
         # truncated collapsed log-likelihood (eq. 58)
         log_p = torch.logsumexp(log_w, dim=-1)            # [B, T]
@@ -443,6 +548,45 @@ class EventFieldMJD(nn.Module):
         }
         return loss, cache
 
+    @torch.no_grad()
+    def _attribute_marked(self, cache):
+        """Per-event posterior from the marked mixture: channel expected counts are
+        read off directly and mapped back to events (top channels by index, the
+        residual channel split over the remaining active events by ``pi``)."""
+        extra = cache["extra"]
+        q = torch.softmax(cache["log_w"], dim=-1)          # [B,T,Pm]
+        pi_bar, rho = cache["pi_bar"], cache["rho"]        # [B,T,M]
+        B, T, M = pi_bar.shape
+        cap = self.marked_cap
+        G = self.mark_grid                                 # [Pm,C]
+
+        Kc = torch.einsum("btp,pc->btc", q, G)             # channel exp. counts [B,T,C]
+        Pc = torch.einsum("btp,pc->btc", q, (G >= 1).float())   # channel P(k>=1)
+        K_bg = Kc[..., 0]
+        K_resp = Kc[..., 1:].sum(-1)
+
+        idx_top = extra["idx_top"]                         # [B,T,cap] (-1 padded)
+        valid = (idx_top >= 0).float()
+        idx_safe = idx_top.clamp_min(0)
+        A = torch.zeros(B, T, M, device=pi_bar.device)
+        P = torch.zeros(B, T, M, device=pi_bar.device)
+        A.scatter_add_(-1, idx_safe, Kc[..., 1:cap + 1] * valid)
+        P.scatter_add_(-1, idx_safe, Pc[..., 1:cap + 1] * valid)
+        top_mask = torch.zeros(B, T, M, device=pi_bar.device)
+        top_mask.scatter_add_(-1, idx_safe, valid)
+        top_mask = top_mask.clamp_max(1.0)
+
+        # residual channel -> spread over active non-top events by pi share
+        pi_nontop = pi_bar * (1.0 - top_mask)
+        share = pi_nontop / pi_nontop.sum(-1, keepdim=True).clamp_min(1e-8)
+        A = A + Kc[..., cap + 1:cap + 2] * share
+        P = P + Pc[..., cap + 1:cap + 2] * share
+
+        return {"R_hat": (A * rho).transpose(1, 2), "A_hat": A.transpose(1, 2),
+                "P_resp": P.transpose(1, 2), "K_resp": K_resp, "K_bg": K_bg,
+                "pi_bar": pi_bar, "active": cache["active"].transpose(1, 2),
+                "Lam_resp": extra["Lam_rp"], "Lam_bg": extra["Lam_bg"]}
+
     # ------------------------------------------------------------------ #
     #  Posterior event attribution (eqs. 60-66)
     # ------------------------------------------------------------------ #
@@ -459,6 +603,9 @@ class EventFieldMJD(nn.Module):
         _, cache = self.forward(batch)
         log_w, pi_bar = cache["log_w"], cache["pi_bar"]
         rho = cache["rho"]                                # [B, T, M] event-specific magnitude
+
+        if self.marked_lik:
+            return self._attribute_marked(cache)
 
         # posterior weights q (eq. 61)
         q = torch.softmax(log_w, dim=-1)                  # [B, T, P]
